@@ -59,7 +59,9 @@ tests/
     ├── qwen3_tts/
     │   └── test_pipeline.py
     ├── higgs_tts/
+    │   ├── test_async_decode_runner.py
     │   ├── test_batched_step.py
+    │   ├── test_cli_async_decode.py
     │   ├── test_pipeline.py
     │   └── test_request_builders.py
     ├── router/
@@ -284,7 +286,9 @@ that happened to contain an older version of the test.
   - OmniScheduler-backed AR stage factory wiring
   - sampler-driven finish handling for eager and CUDA-graph paths
   - request builder sampling normalization and server-side token caps
-  - model slot cleanup and engine timing in scheduler result adapters.
+  - model slot cleanup and engine timing in scheduler result adapters
+  - async-decode one-step-lookahead parity with the synchronous collect path
+  - async-decode default-on config + `--async-decode` tri-state CLI override.
 
 - `unit_test/router/`: SGLang-Omni Router unit tests:
   - router CLI/config behavior
