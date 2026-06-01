@@ -12,9 +12,10 @@ tests/
 │   ├── test_qwen3_omni_*_ci.py
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
-│   ├── test_whisper_asr_ci.py
-│   └── omni_whisper_wer_utils.py
+│   └── test_qwen3_asr_ci.py
 └── unit_test/
+    ├── benchmarks/
+    │   └── test_dataset_regressions.py
     ├── fixtures/
     │   ├── fish_fakes.py
     │   ├── pipeline_fakes.py
@@ -56,6 +57,9 @@ tests/
     │   ├── test_tokenizer.py
     │   ├── test_tp.py
     │   └── test_vision_patch_embed_linear.py
+    ├── qwen3_asr/
+    │   ├── test_pipeline.py
+    │   └── test_request_builders.py
     ├── qwen3_tts/
     │   └── test_pipeline.py
     ├── higgs_tts/
@@ -67,6 +71,10 @@ tests/
     ├── router/
     │   ├── test_app.py
     │   └── test_core.py
+    ├── profiler/
+    │   ├── test_event_recorder.py
+    │   ├── test_stop_run_id.py
+    │   └── test_views.py
     ├── serve/
     │   └── test_openai_api.py
     ├── fishaudio_s2_pro/
@@ -155,20 +163,25 @@ Relevant model CI ownership:
 - `qwen3_omni_thinker_server` / `qwen3_omni_talker_server`: expose the shared
   router-backed Qwen3-Omni endpoint from `conftest.py`.
 - `test_qwen3_omni_tts_ci.py`: gates the SeedTTS speed/WER path through the
-  router and verifies both colocated workers receive traffic.
-- `test_whisper_asr_ci.py`: Whisper large-v3 ASR correctness + speed via
-  SGLang Omni router (DP=2, `/v1/audio/transcriptions`). Uses the first 20
-  English SeedTTS clips; writes `whisper_asr_results.json` for threshold
-  calibration (`whisper-asr-v1` in `tune-ci-thresholds`).
-- `omni_whisper_wer_utils.py`: shared fixture/helpers for talker/TTS WER CI —
+  router at TTS generation concurrency 16 and verifies both colocated workers
+  receive traffic. WER reuses saved audio after the Qwen3-Omni server is
+  stopped, then transcribes through Qwen3-ASR at concurrency 32.
+- `test_qwen3_asr_ci.py`: Qwen3-ASR correctness + speed via SGLang Omni
+  router (`/v1/audio/transcriptions`). Uses the first 20 English SeedTTS
+  clips; writes `qwen3_asr_results.json` for threshold calibration
+  (`qwen3-asr-v1` in `tune-ci-thresholds`). Its stdout uses the same boxed
+  summary style as the other benchmark stages: `ASR WER Benchmark Result`
+  followed by `ASR Speed Benchmark Result`.
+- `utils.py`: shared fixture/helpers for talker/TTS WER CI —
   stops the upstream model server, runs `ensure_gpus_idle.sh`, then launches
-  a DP=2 Whisper router for ASR. Used by Qwen3 talker WER tests and TTS
-  WER tests instead of the in-process transformers Whisper pipeline.
+  a Qwen3-ASR router. It also owns the WER ASR concurrency constant
+  (`QWEN3_ASR_WER_CONCURRENCY`, currently 32). Used by Qwen3 talker WER tests
+  and TTS WER tests instead of the in-process transformers Whisper pipeline.
 - Talker / video WER CI (`test_qwen3_omni_*_talker_ci.py`, `test_tts_ci.py`):
   generate audio with the model router first, tear down that server, free both
-  GPUs, then transcribe saved WAVs through the Omni Whisper router. Long talker
-  clips (>30 s) are chunked client-side in `benchmarks/tasks/tts.py` to match
-  the transformers `chunk_length_s=30` behavior.
+  GPUs, then transcribe saved WAVs through the ASR router. Qwen3-Omni
+  talker/TTS generation concurrency is 16, including the
+  `videoamme_talker_tp2` stage; ASR/WER transcription concurrency is 32.
 - CI env alignment on the H20 repro host: `source .github/scripts/ci_env.sh`
   then `source omni/bin/activate`.
   Omni CI (`omni-ci.yaml`) runs benchmark suites sequentially after one shared
@@ -190,7 +203,9 @@ Relevant model CI ownership:
   with two one-GPU workers using the default model config, runs the
   full SeedTTS EN set (1088 samples) in non-streaming / streaming stages at
   concurrency 16, and frees the server GPUs before ASR/WER and
-  speaker-similarity checks.
+  speaker-similarity checks. Non-streaming and streaming WER pass the selected
+  TTS generation concurrency into the result config while keeping Qwen3-ASR
+  transcription concurrency at 32.
 - `test_tts_consistency_artifacts.py`: CPU-only stage-3 check that compares
   TTS non-stream and streaming `speed_results.json` under
   `${OMNI_CI_HOME}/tts-stage-results/{nonstream,stream}/`.
@@ -231,6 +246,13 @@ that happened to contain an older version of the test.
   - scheduler concurrency
   - scheduler callable contracts, including sync wrappers and callable objects
     that return awaitables.
+- `unit_test/benchmarks/`: Benchmark dataset/loading regression tests.
+- `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
+  - pipeline config and stage factory concurrency defaults
+  - single-source audio token length formula used by both processor and
+    request builder paths
+  - token-level result adapter marker handling, avoiding decode/encode
+    text round-trips for byte-level BPE output.
 - `unit_test/qwen3_omni/` Qwen3-Omni unit tests:
 
   - public CLI/config behavior
