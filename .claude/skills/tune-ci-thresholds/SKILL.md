@@ -119,10 +119,9 @@ this skill only describes **in-container paths** for `tune.py` / precheck /
 calibration. Do not document `docker run`, volume maps, or host-side layout
 in host profiles.
 
-**Agent runbook:** follow
-`.claude/skills/tune-ci-thresholds/AGENT-PRECHECK.md` end-to-end before
-any `tune.py run` (repo, venv, pins, HF weights, speaker_sim, GPUs, precheck
-commands, pass criteria).
+**Agent runbook:** `.claude/skills/tune-ci-thresholds/AGENT-PRECHECK.md` —
+mandatory environment gate (Gates 0–8) before any `tune.py run`. Agent-facing
+only; no Docker or user setup instructions.
 
 Calibration does **not** require CI doc paths (`/sgl-workspace/...`). On a
 repro machine, **`tune.py` loads `hosts/<name>.yaml`** and applies

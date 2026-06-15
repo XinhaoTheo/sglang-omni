@@ -1,196 +1,225 @@
-# Agent runbook — pre-calibration environment verification
+# Agent checklist — environment gate before calibration
 
-**Read this file before any `tune.py run`.** The repro container is already
-running; this document covers **in-container** checks only (no Docker startup).
+**Audience: AI agent only.** Run this checklist at the start of every calibration
+session (including after a fresh container). **Do not** run `tune.py run` until
+every mandatory item passes.
 
-Branch `ci-host-profiles` (vs `main`) added:
+**Assumption:** repro container is already running. Do not document or execute
+`docker run`, volume maps, or host-side setup here.
 
-| Change | Purpose |
-|--------|---------|
-| `hosts/<name>.yaml` | In-container `repo_root`, `venv_python`, cache paths |
-| `tune.py --host` / autodetect | Maps `physical.*` → `HF_HOME`, `SEEDTTS_SIM_CACHE_DIR`, … |
-| `tune.py hosts-list` | List host profiles |
-| `precheck` speaker_sim line | Verifies WavLM assets before TTS similarity / Omni utmos |
-| `default_venv_python` | `/data/chenyang/.python/omni/bin/python` on H20 profile |
+**Policy** (`hosts/*/yaml` → `agent_policy`):
 
-**No symlinks.** If `auto env: HF_HOME=…` in precheck output matches
-`physical.hf_hub` in the host YAML, paths are wired correctly.
+- `env_check: report_missing_first` — report gaps to the user before fixing;
+  fix only what they explicitly asked for, or trivial in-container creates
+  (e.g. empty cache subdirs) that precheck requires.
+- Do not run `prepare_omni_venv.sh` or bulk model downloads when precheck is
+  green or shows a single missing repo.
 
----
-
-## 0. Scope — what are you calibrating?
-
-Confirm with the user (or `handoff:` in host YAML) before spending GPU hours:
-
-| Goal | `--model` | Stages | Repeats |
-|------|-----------|--------|---------|
-| TTS CI only | `tts` | `ALL` | 5 (default) |
-| Qwen3-Omni CI only | `qwen3-omni-v1` | `ALL` | 5 |
-| **Full CI** | run **both** sequentially | each `ALL` | 5 each |
-
-Full CI order: **TTS first**, then **Qwen3-Omni** (matches omni-ci DAG).
+Path source: `hosts/<name>.yaml` (not CI doc paths in `models/*/config.yaml`).
+No symlinks — `precheck` `auto env:` lines must match `physical.*` in the
+host profile.
 
 ---
 
-## 1. Load host profile (mandatory)
+## Gate 0 — Calibration scope
+
+Read `handoff:` in the active host profile and confirm with the user if unclear.
+
+| Scope | `--model` | Stages | Repeats | Order |
+|-------|-----------|--------|---------|-------|
+| TTS CI | `tts` | `ALL` | 5 | — |
+| Qwen3-Omni CI | `qwen3-omni-v1` | `ALL` | 5 | — |
+| Full CI | both | each `ALL` | 5 each | **TTS first**, then Qwen3-Omni |
+
+Run precheck for **every** model you will calibrate before `tune.py run`.
+
+---
+
+## Gate 1 — Host profile loaded
 
 ```bash
-cd /data/chenyang/sglang-omni   # or host profile repo_root
-
 python .claude/skills/tune-ci-thresholds/tune.py hosts-list
-hostname   # should match a profile, e.g. sglang-h20-ci
+hostname
+# then cd to repo_root from host profile (sglang-h20-ci: /data/chenyang/sglang-omni)
+cd /data/chenyang/sglang-omni
 ```
 
-**Selection:** `$TUNE_HOST` → `--host <name>` → autodetect by `hostname`.
+**Pass:**
 
-Shipped profile **`sglang-h20-ci`** (`hosts/sglang-h20-ci.yaml`):
+- Active profile resolves via `$TUNE_HOST` → `--host <name>` → `hostname` match.
+- First line of any `tune.py` subcommand prints
+  `host: <name> (repo=<repo_root>)`.
 
-| Key | Path |
-|-----|------|
+**Fail → report:**
+
+| Observation | Action |
+|-------------|--------|
+| No `host: …` line | Set `--host sglang-h20-ci` or `export TUNE_HOST=sglang-h20-ci`; if hostname wrong, report mismatch |
+| `repo_root` missing / no `pyproject.toml` | Report; do not calibrate |
+
+Reference profile `sglang-h20-ci` (`hosts/sglang-h20-ci.yaml`):
+
+| Key | Expected path |
+|-----|----------------|
 | `repo_root` | `/data/chenyang/sglang-omni` |
 | `venv_python` | `/data/chenyang/.python/omni/bin/python` |
 | `physical.hf_hub` | `/root/.cache/huggingface` |
 | `physical.speaker_sim` | `/root/.cache/huggingface/speaker_sim` |
 | `physical.omni_ci_home` | `/github/home/calibration` |
 
-User paths given in chat **override** the YAML.
+If the user gave different paths in chat, use those and report that host YAML
+may be stale.
 
 ---
 
-## 2. Manual sanity checks (before `precheck`)
+## Gate 2 — Repo, venv, dependency pins
 
-Run these once; fix only what fails. **Report gaps to the user first**
-(`agent_policy.env_check: report_missing_first`) unless they asked you to fix
-a specific item.
-
-### 2.1 Repo + venv
+Set from host profile (example uses `sglang-h20-ci`):
 
 ```bash
 HOST_ROOT=/data/chenyang/sglang-omni
 VENV=/data/chenyang/.python/omni/bin/python
 
-test -f "$HOST_ROOT/pyproject.toml" && echo OK repo
-test -x "$VENV" && echo OK venv
-$VENV -c "import torch, sglang, flashinfer; print('torch', torch.__version__); print('sglang', sglang.__version__); print('cuda', torch.cuda.is_available(), torch.cuda.device_count())"
-$VENV -c "import sglang_omni; print('sglang_omni OK')"
+test -f "$HOST_ROOT/pyproject.toml" && echo PASS repo || echo FAIL repo
+test -x "$VENV" && echo PASS venv || echo FAIL venv
+$VENV -c "import torch, sglang, flashinfer, sglang_omni; \
+  print('torch', torch.__version__); print('sglang', sglang.__version__); \
+  print('cuda', torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
-Expected pins (from `pyproject.toml`): **torch 2.11.0**, **sglang 0.5.12.post1**.
+**Pass:**
 
-Sync code only (do **not** rebuild venv unless precheck proves corrupt):
+- Repo and venv exist.
+- Imports succeed.
+- **torch 2.11.0**, **sglang 0.5.12.post1** (precheck re-validates pins).
 
-```bash
-source $($VENV -c "import sys; print(sys.executable)") 2>/dev/null || true
-# or: source $(dirname $VENV)/activate
-cd "$HOST_ROOT" && uv pip install -e .
-```
+**Fail → report:**
 
-### 2.2 OMNI slice directory (FlashInfer / torchinductor)
-
-```bash
-mkdir -p /github/home/calibration
-$VENV -c "
-import os
-assert os.environ.get('HOME') or True  # tune.py sets HOME at runtime
-omni = '/github/home/calibration'
-for sub in ('.cache', '.torchinductor'):
-    os.makedirs(f'{omni}/{sub}', exist_ok=True)
-print('OK omni_ci_home slice dirs')
-"
-```
-
-At **`tune.py run`** time, also:
-
-```bash
-source "$HOST_ROOT/.github/scripts/ci_env.sh"
-$VENV -c "import os; assert os.environ['TORCHINDUCTOR_CACHE_DIR'].startswith(os.environ['OMNI_CI_HOME'])"
-```
-
-### 2.3 GPUs idle
-
-```bash
-nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv
-# Calibration needs 2× H20, each ≤ 2048 MiB before each pytest (tune.py enforces at run)
-```
-
-Precheck does **not** kill GPU processes — user must free GPUs if busy.
-
-### 2.4 HuggingFace hub cache (models + datasets)
-
-Host profile sets `HF_HOME=/root/.cache/huggingface`. Quick listing:
-
-```bash
-ls /root/.cache/huggingface/hub | rg -i 'qwen3|higgs|seed-tts|video|mmmu|mmsu|marksverdhei' | head -20
-```
-
-**Required for `--model tts` precheck (all stages):**
-
-| Kind | Repo ID |
-|------|---------|
-| model | `boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999` |
-| model | `Qwen/Qwen3-ASR-1.7B` |
-| dataset | `zhaochenyang20/seed-tts-eval-arrow` |
-
-**Additional for `--model qwen3-omni-v1` precheck (all stages):**
-
-| Kind | Repo ID |
-|------|---------|
-| model | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
-| model | `marksverdhei/Qwen3-Omni-30B-A3B-FP8` |
-| dataset | `zhaochenyang20/mmsu-ci-2000` |
-| dataset | `zhaochenyang20/mmmu-ci-50` |
-| dataset | `zhaochenyang20/seed-tts-eval-50-arrow` |
-| dataset | `zhaochenyang20/Video_MME_ci` |
-| dataset | `zhaochenyang20/Video_AMME_ci` |
-
-(Qwen3 also uses `Qwen/Qwen3-ASR-1.7B` for talker WER stages.)
-
-If precheck prints ✗, run **only** the `huggingface-cli download …` lines precheck
-prints — one repo at a time. Use `HF_ENDPOINT=https://hf-mirror.com`. For
-private models, `source ~/.zshrc` first (`HF_TOKEN`).
-
-### 2.5 Speaker Similarity assets (TTS + Qwen3)
-
-Directory: `/root/.cache/huggingface/speaker_sim`
-
-```bash
-SIM=/root/.cache/huggingface/speaker_sim
-ls -lah "$SIM/wavlm_large.pt" "$SIM/wavlm_large_finetune.pth" "$SIM/.complete"
-$VENV -m benchmarks.metrics.speaker_similarity_assets --warm-cache
-# Must end with: cache HIT at .../speaker_sim
-```
-
-Warm-cache env (also in host YAML):
-
-```bash
-source ~/.zshrc
-export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0
-export SEEDTTS_SIM_CACHE_DIR=/root/.cache/huggingface/speaker_sim
-cd /data/chenyang/sglang-omni
-$VENV -m benchmarks.metrics.speaker_similarity_assets --warm-cache
-```
-
-### 2.6 Stage 11 only — `CAP_SYS_PTRACE` (runtime check)
-
-Only needed for `videoamme_talker_tp2`. Skip for TTS-only calibration.
-
-```bash
-grep -q cap_sys_ptrace /proc/self/status && echo ptrace_ok || echo ptrace_MISSING
-# Or: capsh --print | rg -i ptrace
-```
-
-If missing, stage 11 requests 500 — calibrate other stages first; user fixes
-container capability outside this skill.
+| Observation | Action |
+|-------------|--------|
+| FAIL venv | Report path; stop — do not run `prepare_omni_venv.sh` unless user asked |
+| Import / pin error | Try `cd "$HOST_ROOT" && uv pip install -e .` once; re-check; if still fail, report |
+| `cuda False` or GPU count ≠ 2 | Report |
 
 ---
 
-## 3. Official precheck (mandatory gate)
+## Gate 3 — OMNI slice directories
 
-Run **both** models if doing full CI:
+Required for FlashInfer / torchinductor during pytest:
+
+```bash
+OMNI=/github/home/calibration   # or physical.omni_ci_home from host profile
+mkdir -p "$OMNI/.cache" "$OMNI/.torchinductor"
+test -d "$OMNI/.cache" && test -d "$OMNI/.torchinductor" && echo PASS omni_slice
+```
+
+**Pass:** both subdirs exist.
+
+**Fail → report** if creation fails (permissions / read-only root).
+
+Optional verify (matches CI env wiring):
+
+```bash
+cd "$HOST_ROOT"
+source .github/scripts/ci_env.sh
+$VENV -c "import os; assert os.environ['TORCHINDUCTOR_CACHE_DIR'].startswith(os.environ['OMNI_CI_HOME'])"
+```
+
+If `ci_env.sh` sets `HF_HOME=/github/home/.cache/huggingface`, confirm that
+path also contains hub snapshots **or** rely on `tune.py` host profile
+(`HF_HOME=/root/.cache/huggingface`) — precheck `auto env:` is authoritative
+for calibration.
+
+---
+
+## Gate 4 — GPUs idle
+
+```bash
+nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv
+```
+
+**Pass:** 2× H20 (or profile-equivalent), each **≤ 2048 MiB** used before
+calibration runs (`tune.py` re-checks at run time).
+
+**Fail → report** GPU busy; do not start `tune.py run`. Precheck does not kill
+processes.
+
+---
+
+## Gate 5 — HuggingFace weights and datasets
+
+Authoritative check: **`tune.py precheck`** (Gate 8). Quick sanity listing:
+
+```bash
+HF=/root/.cache/huggingface   # or physical.hf_hub from host profile
+ls "$HF/hub" 2>/dev/null | rg -i 'qwen3|higgs|seed-tts|video|mmmu|mmsu|marksverdhei' | head -20
+```
+
+Expected repos by model (precheck validates each):
+
+**`tts`:** models `boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999`,
+`Qwen/Qwen3-ASR-1.7B`; dataset `zhaochenyang20/seed-tts-eval-arrow`.
+
+**`qwen3-omni-v1` (adds):** models `Qwen/Qwen3-Omni-30B-A3B-Instruct`,
+`marksverdhei/Qwen3-Omni-30B-A3B-FP8`; datasets `zhaochenyang20/mmsu-ci-2000`,
+`zhaochenyang20/mmmu-ci-50`, `zhaochenyang20/seed-tts-eval-50-arrow`,
+`zhaochenyang20/Video_MME_ci`, `zhaochenyang20/Video_AMME_ci`.
+
+**Fail → report** missing repos. If precheck prints ✗ with
+`huggingface-cli download …`, run **only** those lines (one repo at a time,
+`HF_ENDPOINT=https://hf-mirror.com`). For private repos, verify `HF_TOKEN`
+(`source ~/.zshrc` or env) before download; if token missing, report first.
+
+---
+
+## Gate 6 — Speaker similarity assets
+
+Directory: `physical.speaker_sim` (default `/root/.cache/huggingface/speaker_sim`).
+
+```bash
+SIM=/root/.cache/huggingface/speaker_sim
+VENV=/data/chenyang/.python/omni/bin/python
+
+for f in wavlm_large.pt wavlm_large_finetune.pth .complete; do
+  test -f "$SIM/$f" && echo PASS "$f" || echo FAIL "$f"
+done
+
+export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0
+export SEEDTTS_SIM_CACHE_DIR="$SIM"
+cd /data/chenyang/sglang-omni
+$VENV -m benchmarks.metrics.speaker_similarity_assets --warm-cache
+# Must print: cache HIT at .../speaker_sim
+```
+
+**Pass:** three files present (each `.pt`/`.pth` ≥ 100 MB); warm-cache **HIT**.
+
+**Fail → report**; if user asked to fix, use `speaker_similarity_bootstrap` in
+host profile. Do not re-download when `.complete` exists and warm-cache HITs.
+
+---
+
+## Gate 7 — `CAP_SYS_PTRACE` (Full CI / Qwen3 stage 11 only)
+
+Skip for TTS-only calibration.
+
+```bash
+grep -qi cap_sys_ptrace /proc/self/status && echo PASS ptrace || echo FAIL ptrace
+```
+
+**Pass:** `PASS ptrace`.
+
+**Fail → report**; stage `videoamme_talker_tp2` will fail. Calibrate other
+stages only if user accepts partial scope.
+
+---
+
+## Gate 8 — Official precheck (mandatory)
+
+Run for **each** model in Gate 0 scope:
 
 ```bash
 cd /data/chenyang/sglang-omni
-export TUNE_HOST=sglang-h20-ci   # optional if hostname autodetects
+export TUNE_HOST=sglang-h20-ci   # if Gate 1 autodetect failed
 
 python .claude/skills/tune-ci-thresholds/tune.py --model tts precheck \
   --output-dir /tmp/precheck_tts
@@ -199,14 +228,16 @@ python .claude/skills/tune-ci-thresholds/tune.py --model qwen3-omni-v1 precheck 
   --output-dir /tmp/precheck_qwen3
 ```
 
-**Pass criteria — every line must be good:**
+Add `--host sglang-h20-ci` if autodetect failed in Gate 1.
+
+**Pass — every line good, ends with `precheck OK`:**
 
 ```
 host: sglang-h20-ci (repo=...)
 venv_python: ... [ok]
   sglang: 0.5.12.post1 (pin ...) [ok]
   torch: 2.11.0+cu130 (pin ...) [ok]
-  auto env: HF_HOME=/root/.cache/huggingface          ← must match physical.hf_hub
+  auto env: HF_HOME=/root/.cache/huggingface
   auto env: SEEDTTS_SIM_CACHE_DIR=/root/.cache/huggingface/speaker_sim
     ✓ model: ...
     ✓ dataset: ...
@@ -216,21 +247,25 @@ venv_python: ... [ok]
 precheck OK
 ```
 
-**Common false alarms:**
+`auto env: HF_HOME` **must** match `physical.hf_hub` in host profile.
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| HF ✗ but files exist under `/root/.cache/huggingface` | Host profile not loaded | `--host sglang-h20-ci` or fix hostname |
-| HF ✗, wrong `HF_HOME` in auto env | Same | Same |
-| speaker_sim ✗ | Missing warm-cache | §2.5 |
-| GPU busy | Other jobs | User frees GPUs |
+**Common misreads:**
+
+| Symptom | Likely cause | Agent action |
+|---------|--------------|--------------|
+| HF ✗ but files under `/root/.cache/huggingface` | Host profile not loaded | `--host` / `$TUNE_HOST` |
+| Wrong `HF_HOME` in `auto env` | Same | Same |
+| speaker_sim ✗ | Gate 6 incomplete | Fix per Gate 6 or report |
+| GPU busy | Gate 4 | Report |
 
 Do **not** run `prepare_omni_venv.sh` or bulk `ensure_hf_models.sh` when precheck
 is green or only reports one missing repo.
 
 ---
 
-## 4. Optional smoke test (after precheck OK)
+## Gate 9 — Optional smoke (after precheck OK)
+
+Only if time permits or user requested; not a substitute for Gate 8.
 
 ```bash
 cd /data/chenyang/sglang-omni
@@ -242,29 +277,27 @@ bash .github/scripts/run_flaky_pytest.sh \
   pytest tests/test_model/test_qwen3_omni_videomme_ci.py -v -s -x
 ```
 
-Router/worker startup **< ~60s** after FlashInfer cold compile — if much slower,
-fix env (`XDG_CACHE_HOME`, `HOME`) before calibration.
+Router/worker cold start **< ~60s** after FlashInfer compile. Much slower →
+report env issue (`XDG_CACHE_HOME`, `HOME`, HF path split) before calibration.
 
 ---
 
-## 5. Ready for calibration
+## Proceed to calibration
 
-When §3 passes for every `--model` you will run:
+**All mandatory gates (0–8 for your scope) pass** → follow `SKILL.md` for
+`tune.py run` (dual-terminal tail, poll ≤120s, strict audit).
 
-1. Create run dir: `.tune-runs/<timestamp>_<model>_all_r5/`
-2. Spawn **Tab A** (`tail_calibration_pytest.sh`) then **Tab B** (`tune.py run`)
-3. Poll ≤120s; show **strict audit** ✓ counts, not only `ok/total`
-4. Do not start `run` until user confirmed scope (unless already in `handoff`)
+Before `run`:
 
-Update `handoff:` in `hosts/sglang-h20-ci.yaml` when pausing mid-calibration.
+- Confirm scope with user unless `handoff:` is explicit.
+- Update `handoff:` in host profile when pausing mid-run.
 
----
-
-## 6. Forbidden before / during calibration
+**Forbidden:**
 
 - Document or run `docker run` inside this skill
-- Create symlinks for `HF_HOME` / `SEEDTTS_SIM_CACHE_DIR` when host profile is active
-- `prepare_omni_venv.sh` / bulk downloads when precheck only shows specific ✗
 - `tune.py run` with pytest `-x`
+- Symlinks for `HF_HOME` / `SEEDTTS_SIM_CACHE_DIR` when host profile is active
+- `prepare_omni_venv.sh` / bulk downloads when precheck is green or one-repo ✗
+- Start calibration while any Gate 8 model shows not `precheck OK`
 - Proceed while strict audit has △/✗ repeats
-- Fix env without reporting to user first (unless user explicitly asked)
+- Fix env without reporting first (unless user explicitly asked)
