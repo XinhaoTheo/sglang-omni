@@ -31,7 +31,16 @@ class _CharTokenizer:
         ("", 8, [], ""),
         ("short", 8, [], ""),
         ("abcdef", 0, [97, 98, 99, 100, 101, 102], "abcdef"),
-        ("abcdef", 2, [97, 98, 99, 100], "abcd"),
+        # No whitespace anywhere before the cut: no safe boundary to land
+        # on, so the whole run rolls back rather than keeping a fragment.
+        ("abcdef", 2, [], ""),
+        # Cut lands mid-word ("in this" with rollback=3 cuts inside "this"):
+        # back up to the start of that word instead of keeping "in thi".
+        # The boundary space itself is stripped too, so the continuation's
+        # own leading space is the only separator.
+        ("in this", 3, [ord(c) for c in "in"], "in"),
+        # Cut already lands on a word boundary: same result.
+        ("in this", 4, [ord(c) for c in "in"], "in"),
     ],
 )
 def test_retained_streaming_prefix_rolls_back_chars(
@@ -112,8 +121,8 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
                 inputs={"audio_bytes": b"wav"},
                 params={
                     "_asr_streaming": True,
-                    "_asr_streaming_prefix_text": "abcdef",
-                    "_asr_streaming_rollback_chars": 2,
+                    "_asr_streaming_prefix_text": "abc def",
+                    "_asr_streaming_rollback_chars": 3,
                     "repetition_penalty": 1.3,
                 },
             ),
@@ -123,10 +132,10 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
     data.output_ids = [101, 102]
     result = result_adapter(data)
 
-    assert data.prompt_token_ids[-4:] == [97, 98, 99, 100]
-    assert data.streaming_prefix_text == "abcd"
+    assert data.prompt_token_ids[-3:] == [97, 98, 99]
+    assert data.streaming_prefix_text == "abc"
     assert data.req.sampling_params.repetition_penalty == 1.3
-    assert result.data["text"] == "abcdef"
+    assert result.data["text"] == "abcef"
 
 
 def test_request_builder_defaults_to_no_repetition_penalty_when_not_streaming(

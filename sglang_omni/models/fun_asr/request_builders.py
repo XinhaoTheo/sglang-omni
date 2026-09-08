@@ -91,10 +91,28 @@ def _decode_token_ids(
         return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
+def _align_to_word_boundary(text: str, cut: int) -> int:
+    # note (Xinhao Tan): a raw char-count cut can land mid-word (e.g. "this"
+    # -> "thi"), forcing the model to continue from a fragment it can't
+    # reliably complete. Walk back to the nearest whitespace instead; no
+    # whitespace at all means roll back the whole run.
+    if cut <= 0 or cut >= len(text):
+        return cut
+    if text[cut - 1].isspace() or text[cut].isspace():
+        return cut
+    while cut > 0 and not text[cut - 1].isspace():
+        cut -= 1
+    return cut
+
+
 def _retained_streaming_prefix(
     tokenizer: Any, text: str, rollback_chars: int
 ) -> tuple[list[int], str]:
-    retained_text = text[: max(len(text) - rollback_chars, 0)]
+    cut = _align_to_word_boundary(text, max(len(text) - rollback_chars, 0))
+    # note (Xinhao Tan): drop a trailing boundary space here — the
+    # continuation's own leading-space token supplies the separator, so
+    # keeping both doubles up the whitespace between words.
+    retained_text = text[:cut].rstrip()
     if not retained_text:
         return [], ""
     token_ids = tokenizer(retained_text, add_special_tokens=False).input_ids
