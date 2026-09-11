@@ -85,5 +85,10 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
         assert self._model_runner is not None
         return self._model_runner.reset_request
 
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        from sglang_omni.models.voxcpm2.request_builders import build_stream_output
+
+        return {"stream_output_builder": build_stream_output}
+
 
 __all__ = ["VoxCPM2EngineBuilder"]
