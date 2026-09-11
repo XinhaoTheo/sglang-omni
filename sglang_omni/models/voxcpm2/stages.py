@@ -102,10 +102,31 @@ def create_reference_encode_executor(
     return SimpleScheduler(encoder.encode_payload, max_concurrency=max_concurrency)
 
 
-def create_tts_engine_executor(model_path: str, **kwargs: object) -> SimpleScheduler:
-    raise NotImplementedError(
-        "VoxCPM2 tts_engine is not implemented yet; the AR backbone and the "
-        "local DiT sampler land in a follow-up change"
+def create_tts_engine_executor(
+    model_path: str,
+    *,
+    device: str = "cuda",
+    gpu_id: int | None = None,
+    dtype: str = "bfloat16",
+    inference_timesteps: int = C.DEFAULT_INFERENCE_TIMESTEPS,
+    cfg_value: float = C.DEFAULT_CFG_VALUE,
+    min_len: int = C.DEFAULT_MIN_LEN,
+    max_len: int = C.DEFAULT_MAX_LEN,
+    max_running_requests: int = 1,
+) -> object:
+    del min_len, max_len  # per-request, resolved in the runner from the payload
+    from sglang_omni.models.voxcpm2.engine_builder import VoxCPM2EngineBuilder
+
+    builder = VoxCPM2EngineBuilder(
+        inference_timesteps=inference_timesteps,
+        cfg_value=cfg_value,
+        max_running_requests=max_running_requests,
+    )
+    return builder.build(
+        model_path,
+        device=device,
+        gpu_id=0 if gpu_id is None else gpu_id,
+        dtype=dtype,
     )
 
 

@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -12,6 +13,7 @@ from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.models.voxcpm2.hf_config import VoxCPM2RuntimeConfig
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import load_state, store_state
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
 
@@ -134,6 +136,135 @@ def build_voxcpm2_state(
         seed=_first(tts_params.get("seed"), params.get("seed"), default=None),
         stream=bool(params.get("stream")),
     )
+
+
+@dataclass
+class VoxCPM2PrefillInputs:
+    """The full AR prefix: tokens, latent patches, and the two span masks."""
+
+    text_token: torch.Tensor
+    audio_feat: torch.Tensor
+    text_mask: torch.Tensor
+    audio_mask: torch.Tensor
+
+
+def _ref_prefix(
+    ref_latents: torch.Tensor, *, start_id: int, end_id: int, feat_dim: int
+) -> VoxCPM2PrefillInputs:
+    """Wrap reference latents in their start/end tokens, padded at both edges."""
+    length = ref_latents.shape[0]
+    patch_size = ref_latents.shape[1]
+    pad = torch.zeros((1, patch_size, feat_dim), dtype=ref_latents.dtype)
+    return VoxCPM2PrefillInputs(
+        text_token=torch.cat(
+            [
+                torch.tensor([start_id], dtype=torch.int32),
+                torch.zeros(length, dtype=torch.int32),
+                torch.tensor([end_id], dtype=torch.int32),
+            ]
+        ),
+        audio_feat=torch.cat([pad, ref_latents, pad], dim=0),
+        text_mask=torch.cat(
+            [
+                torch.tensor([1], dtype=torch.int32),
+                torch.zeros(length, dtype=torch.int32),
+                torch.tensor([1], dtype=torch.int32),
+            ]
+        ),
+        audio_mask=torch.cat(
+            [
+                torch.tensor([0], dtype=torch.int32),
+                torch.ones(length, dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            ]
+        ),
+    )
+
+
+def build_prefill_inputs(
+    state: VoxCPM2State, *, tokenizer: Any, patch_size: int, feat_dim: int
+) -> VoxCPM2PrefillInputs:
+    """Lay out the AR prefix: reference prefix, then text, then prompt audio.
+
+    The masks say which positions the base stack reads as text embeddings and
+    which it reads as latent patches; every position carries exactly one.
+    """
+    text_token = torch.as_tensor(state.text_token, dtype=torch.int32)
+    text_length = int(text_token.shape[0])
+    empty_feat = torch.zeros((text_length, patch_size, feat_dim), dtype=torch.float32)
+
+    tokens = [text_token]
+    feats = [empty_feat]
+    text_masks = [torch.ones(text_length, dtype=torch.int32)]
+    audio_masks = [torch.zeros(text_length, dtype=torch.int32)]
+
+    if state.ref_latents is not None:
+        prefix = _ref_prefix(
+            torch.as_tensor(state.ref_latents),
+            start_id=int(tokenizer.convert_tokens_to_ids(C.AUDIO_PROMPT_START_TOKEN)),
+            end_id=int(tokenizer.convert_tokens_to_ids(C.AUDIO_PROMPT_END_TOKEN)),
+            feat_dim=feat_dim,
+        )
+        tokens.insert(0, prefix.text_token)
+        feats.insert(0, prefix.audio_feat)
+        text_masks.insert(0, prefix.text_mask)
+        audio_masks.insert(0, prefix.audio_mask)
+
+    if state.prompt_latents is not None:
+        prompt = torch.as_tensor(state.prompt_latents)
+        prompt_length = int(prompt.shape[0])
+        tokens.append(torch.zeros(prompt_length, dtype=torch.int32))
+        feats.append(prompt)
+        text_masks.append(torch.zeros(prompt_length, dtype=torch.int32))
+        audio_masks.append(torch.ones(prompt_length, dtype=torch.int32))
+
+    return VoxCPM2PrefillInputs(
+        text_token=torch.cat(tokens),
+        audio_feat=torch.cat(feats, dim=0),
+        text_mask=torch.cat(text_masks),
+        audio_mask=torch.cat(audio_masks),
+    )
+
+
+@dataclass
+class VoxCPM2SGLangRequestData:
+    """Per-request engine data the scheduler hangs off the sglang request."""
+
+    stage_payload: StagePayload
+    state: VoxCPM2State
+    prefill: VoxCPM2PrefillInputs
+    req: Any = None
+    cond: Any = None
+    latent_patches: list[Any] = field(default_factory=list)
+    finish_reason: str | None = None
+    engine_start_s: float = field(default_factory=time.perf_counter)
+
+
+def build_sglang_voxcpm2_request(
+    payload: StagePayload, *, tokenizer: Any, patch_size: int, feat_dim: int
+) -> VoxCPM2SGLangRequestData:
+    state = load_state(payload, VoxCPM2State)
+    return VoxCPM2SGLangRequestData(
+        stage_payload=payload,
+        state=state,
+        prefill=build_prefill_inputs(
+            state, tokenizer=tokenizer, patch_size=patch_size, feat_dim=feat_dim
+        ),
+    )
+
+
+def apply_voxcpm2_result(data: VoxCPM2SGLangRequestData) -> StagePayload:
+    """Fold the sampled patches into the payload the vocoder stage reads."""
+    if not data.latent_patches:
+        raise RuntimeError("VoxCPM2 generated no latent patches")
+    state = data.state
+    patches = torch.stack(data.latent_patches, dim=0)
+    state.generated_latents = patches.permute(2, 0, 1).reshape(patches.shape[2], -1)
+    state.completion_tokens = len(data.latent_patches)
+    state.prompt_tokens = int(data.prefill.text_token.numel())
+    state.engine_time_s = time.perf_counter() - data.engine_start_s
+    state.finish_reason = data.finish_reason
+    return store_state(data.stage_payload, state)
 
 
 def preprocess_voxcpm2_payload(payload: StagePayload) -> StagePayload:
