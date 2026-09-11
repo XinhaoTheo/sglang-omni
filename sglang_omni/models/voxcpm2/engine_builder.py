@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang_omni.models.voxcpm2 import constants as C
+from sglang_omni.models.voxcpm2.hf_config import VOXCPM2_MODEL_ARCH_OVERRIDE
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
             raise ValueError("VoxCPM2 inference_timesteps must be positive")
         if self.max_running_requests <= 0:
             raise ValueError("VoxCPM2 max_running_requests must be positive")
+        self.model_arch_override = VOXCPM2_MODEL_ARCH_OVERRIDE
         self._model_runner: Any | None = None
         self._tokenizer: Any | None = None
 
@@ -77,13 +79,17 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
                 tokenizer=self._tokenizer,
                 patch_size=model.patch_size,
                 feat_dim=model.feat_dim,
+                vocab_size=int(model.config.vocab_size),
             )
 
         return _build_request, apply_voxcpm2_result
 
     def make_abort_callback(self) -> Any | None:
-        assert self._model_runner is not None
-        return self._model_runner.reset_request
+        # note (Xinhao Tan): returning None is deliberate, not an omission.
+        # The runner keeps no per-request state of its own - a step's patches
+        # live on request.data, which the scheduler frees with the request -
+        # and the streaming vocoder registers its own cleanup.
+        return None
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
         from sglang_omni.models.voxcpm2.request_builders import build_stream_output

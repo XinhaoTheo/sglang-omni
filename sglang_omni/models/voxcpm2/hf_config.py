@@ -14,6 +14,7 @@ from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.models.weight_loader import resolve_model_path
 
 VOXCPM2_MODEL_TYPE = "voxcpm2"
+VOXCPM2_MODEL_ARCH_OVERRIDE = "VoxCPM2SGLangModel"
 
 _voxcpm2_hf_config_registered = False
 
@@ -160,6 +161,7 @@ def register_voxcpm2_hf_config() -> None:
 
 
 __all__ = [
+    "VOXCPM2_MODEL_ARCH_OVERRIDE",
     "VOXCPM2_MODEL_TYPE",
     "VoxCPM2Config",
     "VoxCPM2RuntimeConfig",

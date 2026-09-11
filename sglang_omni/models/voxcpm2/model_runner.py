@@ -48,9 +48,6 @@ class VoxCPM2ModelRunner(ModelRunner):
         if requests:
             self._advance(requests, rows=None, is_prefill=False)
 
-    def reset_request(self, request_id: str) -> None:
-        del request_id
-
     @staticmethod
     def _prefill_rows(requests: list) -> torch.Tensor:
         """Index of each request's final prompt position in the packed batch."""

@@ -63,7 +63,6 @@ class VoxCPM2StreamingVocoder(StreamingSimpleScheduler):
         self._states: dict[str, _StreamState] = {}
         self._lock = threading.Lock()
 
-    # -- streaming ------------------------------------------------------
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
@@ -94,7 +93,6 @@ class VoxCPM2StreamingVocoder(StreamingSimpleScheduler):
         with self._lock:
             self._states.pop(request_id, None)
 
-    # -- decode ---------------------------------------------------------
     def _decode_window(self, state: _StreamState) -> torch.Tensor | None:
         total = len(state.patches)
         window_start = max(0, state.emitted_patches - self._overlap)
