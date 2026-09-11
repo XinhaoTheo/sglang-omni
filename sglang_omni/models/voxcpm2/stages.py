@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+"""VoxCPM2 stage factories: preprocessing, reference encode, engine and vocoder."""
+
+from __future__ import annotations
+
+import logging
+from functools import lru_cache
+from pathlib import Path
+
+import torch
+from transformers import AutoTokenizer
+
+from sglang_omni.models.voxcpm2.components.audio_vae import AudioVAE, AudioVAEConfig
+from sglang_omni.models.voxcpm2.hf_config import (
+    VoxCPM2RuntimeConfig,
+    load_voxcpm2_config,
+)
+from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
+from sglang_omni.models.voxcpm2.reference_encode import VoxCPM2ReferenceEncoder
+from sglang_omni.models.voxcpm2.request_builders import (
+    VoxCPM2PreprocessingContext,
+    preprocess_voxcpm2_payload,
+    set_voxcpm2_preprocessing_context,
+)
+from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import load_state, store_state
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+from sglang_omni.utils.checkpoint import resolve_checkpoint
+
+logger = logging.getLogger(__name__)
+
+_AUDIO_VAE_FILES = ("audiovae.safetensors", "audiovae.pth")
+
+
+def _load_audio_vae(
+    checkpoint: str, config: VoxCPM2RuntimeConfig, *, device: str
+) -> AudioVAE:
+    """Build the AudioVAE and load its standalone checkpoint file."""
+    root = Path(checkpoint)
+    for name in _AUDIO_VAE_FILES:
+        path = root / name
+        if not path.is_file():
+            continue
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state_dict = load_file(str(path), device="cpu")
+        else:
+            loaded = torch.load(str(path), map_location="cpu", weights_only=True)
+            state_dict = loaded.get("state_dict", loaded)
+        vae = AudioVAE(AudioVAEConfig(**config.audio_vae))
+        vae.load_state_dict(state_dict, assign=True)
+        # note (Xinhao Tan): do not fold the VAE into the bfloat16 cast the rest
+        # of the model takes. Upstream casts the whole model to the config dtype
+        # and then casts the VAE back to float32; matching that is the only way
+        # to reproduce its audio.
+        return vae.eval().to(device=device, dtype=torch.float32)
+
+    raise FileNotFoundError(
+        f"VoxCPM2 AudioVAE checkpoint not found under {root}; "
+        f"expected one of {list(_AUDIO_VAE_FILES)}"
+    )
+
+
+@lru_cache(maxsize=2)
+def _resolved(model_path: str) -> tuple[str, VoxCPM2RuntimeConfig]:
+    checkpoint = resolve_checkpoint(model_path)
+    return checkpoint, load_voxcpm2_config(checkpoint)
+
+
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+) -> SimpleScheduler:
+    checkpoint, config = _resolved(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    set_voxcpm2_preprocessing_context(
+        VoxCPM2PreprocessingContext(config=config, tokenizer=tokenizer)
+    )
+    return SimpleScheduler(preprocess_voxcpm2_payload, max_concurrency=max_concurrency)
+
+
+def create_reference_encode_executor(
+    model_path: str,
+    *,
+    device: str = "cuda",
+    gpu_id: int | None = None,
+    dtype: str = "bfloat16",
+    max_concurrency: int = 8,
+    max_batch_size: int = 8,
+    max_batch_wait_ms: int = 10,
+) -> SimpleScheduler:
+    del dtype, max_batch_size, max_batch_wait_ms  # the VAE encoder runs per request
+    checkpoint, config = _resolved(model_path)
+    worker_device = device if gpu_id is None else f"{device}:{gpu_id}"
+    encoder = VoxCPM2ReferenceEncoder(
+        _load_audio_vae(checkpoint, config, device=worker_device),
+        patch_size=config.patch_size,
+        cache_model_identity=str(model_path),
+    )
+    return SimpleScheduler(encoder.encode_payload, max_concurrency=max_concurrency)
+
+
+def create_tts_engine_executor(model_path: str, **kwargs: object) -> SimpleScheduler:
+    raise NotImplementedError(
+        "VoxCPM2 tts_engine is not implemented yet; the AR backbone and the "
+        "local DiT sampler land in a follow-up change"
+    )
+
+
+def create_vocoder_executor(
+    model_path: str,
+    *,
+    device: str = "cuda",
+    gpu_id: int | None = None,
+    max_batch_size: int = 4,
+    max_concurrency: int = 4,
+) -> SimpleScheduler:
+    del max_batch_size  # latent lengths differ per request; batching lands with streaming
+    checkpoint, config = _resolved(model_path)
+    worker_device = device if gpu_id is None else f"{device}:{gpu_id}"
+    audio_vae = _load_audio_vae(checkpoint, config, device=worker_device)
+
+    def decode_payload(payload: StagePayload) -> StagePayload:
+        state = load_state(payload, VoxCPM2State)
+        if state.generated_latents is None:
+            raise ValueError("VoxCPM2 vocoder received a payload without latents")
+        latents = torch.as_tensor(state.generated_latents)
+        if latents.ndim == 2:
+            latents = latents.unsqueeze(0)
+        waveform = audio_vae.decode(
+            latents.to(device=worker_device, dtype=torch.float32),
+            state.out_sample_rate,
+        )
+        state.generated_latents = None
+        state.sample_rate = state.out_sample_rate
+        payload = store_state(payload, state)
+        payload.data["audio"] = waveform.squeeze(1).detach().cpu()
+        return payload
+
+    return SimpleScheduler(decode_payload, max_concurrency=max_concurrency)
+
+
+__all__ = [
+    "create_preprocessing_executor",
+    "create_reference_encode_executor",
+    "create_tts_engine_executor",
+    "create_vocoder_executor",
+]
