@@ -8,8 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from transformers import PretrainedConfig
+
 from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.models.weight_loader import resolve_model_path
+
+VOXCPM2_MODEL_TYPE = "voxcpm2"
+
+_voxcpm2_hf_config_registered = False
 
 
 @dataclass
@@ -82,4 +88,81 @@ def load_voxcpm2_config(
     )
 
 
-__all__ = ["VoxCPM2RuntimeConfig", "load_voxcpm2_config"]
+class VoxCPM2Config(PretrainedConfig):
+    """The AR stacks as one flat model, which is what SGLang sizes itself from."""
+
+    model_type = VOXCPM2_MODEL_TYPE
+
+    def __init__(
+        self,
+        lm_config: dict[str, Any] | PretrainedConfig | None = None,
+        voxcpm2_config: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # note (Xinhao Tan): VoxCPM2 has two AR stacks, the base LM and the
+        # residual acoustic LM, and sglang_model lays them out as one flat list
+        # of layers sharing a single KV pool. So num_hidden_layers below is the
+        # sum of both stacks, not the base stack's own depth, and this config is
+        # the flattened view of the pair rather than a copy of either one.
+        #
+        # That sum only reaches SGLang through this top-level config: SGLang
+        # picks what it sizes the pool from by looking for text_config /
+        # llm_config / language_config / thinker_config, "lm_config" matches
+        # none of them, so it falls back here. Renaming this to llm_config hands
+        # SGLang the base stack's depth instead and leaves the pool too small
+        # for the residual stack's layer ids.
+        if isinstance(lm_config, dict):
+            lm_config = PretrainedConfig(**lm_config)
+        self.lm_config = lm_config
+        self.voxcpm2_config = dict(voxcpm2_config or {})
+
+        if lm_config is not None:
+            base_layers = int(getattr(lm_config, "num_hidden_layers", 0))
+            residual_layers = int(self.voxcpm2_config.get("residual_lm_num_layers", 0))
+            kwargs.setdefault("num_hidden_layers", base_layers + residual_layers)
+            for field_name in (
+                "hidden_size",
+                "intermediate_size",
+                "max_position_embeddings",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "rms_norm_eps",
+                "rope_theta",
+                "rope_scaling",
+                "vocab_size",
+                "scale_emb",
+                "dim_model_base",
+                "scale_depth",
+                "use_mup",
+            ):
+                value = getattr(lm_config, field_name, None)
+                if value is not None:
+                    kwargs.setdefault(field_name, value)
+        super().__init__(**kwargs)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, Any], **kwargs: Any) -> "VoxCPM2Config":
+        merged = dict(config_dict)
+        merged.setdefault("voxcpm2_config", dict(config_dict))
+        return super().from_dict(merged, **kwargs)
+
+
+def register_voxcpm2_hf_config() -> None:
+    """Register the local VoxCPM2 config before SGLang builds its ModelConfig."""
+    global _voxcpm2_hf_config_registered
+    if _voxcpm2_hf_config_registered:
+        return
+
+    from transformers import AutoConfig
+
+    AutoConfig.register(VOXCPM2_MODEL_TYPE, VoxCPM2Config, exist_ok=True)
+    _voxcpm2_hf_config_registered = True
+
+
+__all__ = [
+    "VOXCPM2_MODEL_TYPE",
+    "VoxCPM2Config",
+    "VoxCPM2RuntimeConfig",
+    "load_voxcpm2_config",
+    "register_voxcpm2_hf_config",
+]
