@@ -253,6 +253,13 @@ def build_sglang_voxcpm2_request(
     )
 
 
+def build_stream_output(data: VoxCPM2SGLangRequestData) -> dict[str, Any] | None:
+    """One streamed chunk: the patch sampled by the step that just finished."""
+    if not data.latent_patches:
+        return None
+    return {"patch": data.latent_patches[-1]}
+
+
 def apply_voxcpm2_result(data: VoxCPM2SGLangRequestData) -> StagePayload:
     """Fold the sampled patches into the payload the vocoder stage reads."""
     if not data.latent_patches:

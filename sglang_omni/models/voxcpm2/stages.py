@@ -10,20 +10,18 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
+from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.models.voxcpm2.components.audio_vae import AudioVAE, AudioVAEConfig
 from sglang_omni.models.voxcpm2.hf_config import (
     VoxCPM2RuntimeConfig,
     load_voxcpm2_config,
 )
-from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.models.voxcpm2.reference_encode import VoxCPM2ReferenceEncoder
 from sglang_omni.models.voxcpm2.request_builders import (
     VoxCPM2PreprocessingContext,
     preprocess_voxcpm2_payload,
     set_voxcpm2_preprocessing_context,
 )
-from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.pipeline_state import load_state, store_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 
@@ -135,32 +133,24 @@ def create_vocoder_executor(
     *,
     device: str = "cuda",
     gpu_id: int | None = None,
-    max_batch_size: int = 4,
-    max_concurrency: int = 4,
-) -> SimpleScheduler:
-    del max_batch_size  # latent lengths differ per request; batching lands with streaming
+    max_batch_size: int = 1,
+    stream_stride: int = 8,
+    stream_followup_stride: int = 4,
+    overlap_patches: int = C.DEFAULT_STREAMING_PREFIX_LEN - 1,
+) -> object:
+    from sglang_omni.models.voxcpm2.streaming_vocoder import VoxCPM2StreamingVocoder
+
     checkpoint, config = _resolved(model_path)
     worker_device = device if gpu_id is None else f"{device}:{gpu_id}"
-    audio_vae = _load_audio_vae(checkpoint, config, device=worker_device)
-
-    def decode_payload(payload: StagePayload) -> StagePayload:
-        state = load_state(payload, VoxCPM2State)
-        if state.generated_latents is None:
-            raise ValueError("VoxCPM2 vocoder received a payload without latents")
-        latents = torch.as_tensor(state.generated_latents)
-        if latents.ndim == 2:
-            latents = latents.unsqueeze(0)
-        waveform = audio_vae.decode(
-            latents.to(device=worker_device, dtype=torch.float32),
-            state.out_sample_rate,
-        )
-        state.generated_latents = None
-        state.sample_rate = state.out_sample_rate
-        payload = store_state(payload, state)
-        payload.data["audio"] = waveform.squeeze(1).detach().cpu()
-        return payload
-
-    return SimpleScheduler(decode_payload, max_concurrency=max_concurrency)
+    return VoxCPM2StreamingVocoder(
+        _load_audio_vae(checkpoint, config, device=worker_device),
+        device=worker_device,
+        patch_size=config.patch_size,
+        stream_stride=stream_stride,
+        stream_followup_stride=stream_followup_stride,
+        overlap_patches=overlap_patches,
+        max_batch_size=max_batch_size,
+    )
 
 
 __all__ = [
