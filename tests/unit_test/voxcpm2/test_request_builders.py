@@ -75,7 +75,10 @@ def test_reference_with_transcript_becomes_continuation_audio():
     assert state.prompt_audio == "ref.wav"
     assert state.reference_audio == ""
     assert state.prompt_text == "hello"
-    # The transcript is prefixed to the target text the model continues from.
+
+
+def test_continuation_prefixes_the_transcript_to_the_target_text():
+    state = _state_for([{"audio_path": "ref.wav", "text": "hello"}])
     assert state.text_token.tolist()[: len("hello")] == [ord(c) for c in "hello"]
 
 
@@ -108,7 +111,7 @@ def test_reference_prefix_leads_and_prompt_audio_trails():
     prefill = _prefill(state)
 
     assert int(prefill.text_token[0]) == _TOKEN_IDS[C.AUDIO_PROMPT_START_TOKEN]
-    # 1 start + 5 reference + 1 end, then the text, then the prompt audio.
+    # note (Xinhao Tan): index 6 is 1 start token + 5 reference patches + 1 end.
     assert int(prefill.text_token[6]) == _TOKEN_IDS[C.AUDIO_PROMPT_END_TOKEN]
     assert prefill.audio_mask[-2:].tolist() == [1, 1]
     assert prefill.text_mask[-2:].tolist() == [0, 0]

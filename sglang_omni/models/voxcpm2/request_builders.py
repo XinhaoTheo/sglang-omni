@@ -12,6 +12,7 @@ import torch
 from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.models.voxcpm2.hf_config import VoxCPM2RuntimeConfig
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
+from sglang_omni.preprocessing.cache_key import hash_bytes
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import load_state, store_state
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
@@ -240,16 +241,58 @@ class VoxCPM2SGLangRequestData:
     engine_start_s: float = field(default_factory=time.perf_counter)
 
 
+def audio_prefix_fingerprint(prefill: VoxCPM2PrefillInputs) -> str | None:
+    """Stable hash of the latent positions, for use as the radix ``extra_key``.
+
+    Audio positions carry token id 0 and the real content rides in the latent
+    patches, so two requests with different reference audio produce identical
+    input ids. Without this key they would share a KV prefix and one caller's
+    voice would surface in another's audio. None when there is no audio, so
+    zero-shot requests still share one subtree.
+    """
+    if not bool(prefill.audio_mask.any()):
+        return None
+    latents = prefill.audio_feat[prefill.audio_mask.bool()]
+    return hash_bytes(latents.detach().to(torch.float32).cpu().numpy().tobytes())
+
+
 def build_sglang_voxcpm2_request(
-    payload: StagePayload, *, tokenizer: Any, patch_size: int, feat_dim: int
+    payload: StagePayload,
+    *,
+    tokenizer: Any,
+    patch_size: int,
+    feat_dim: int,
+    vocab_size: int,
 ) -> VoxCPM2SGLangRequestData:
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
     state = load_state(payload, VoxCPM2State)
+    prefill = build_prefill_inputs(
+        state, tokenizer=tokenizer, patch_size=patch_size, feat_dim=feat_dim
+    )
+
+    sampling_params = SamplingParams(
+        max_new_tokens=int(state.max_len), temperature=0.0, stop_token_ids=[]
+    )
+    sampling_params.normalize(None)
+    sampling_params.verify(int(vocab_size))
+
+    req = Req(
+        rid=payload.request_id,
+        origin_input_text="",
+        origin_input_ids=prefill.text_token.tolist(),
+        sampling_params=sampling_params,
+        eos_token_ids=set(),
+        vocab_size=int(vocab_size),
+        extra_key=audio_prefix_fingerprint(prefill),
+    )
+    req.tokenizer = None
+    req._input_embeds_are_projected = True
+    req._codec_suppress_tokens = None
+
     return VoxCPM2SGLangRequestData(
-        stage_payload=payload,
-        state=state,
-        prefill=build_prefill_inputs(
-            state, tokenizer=tokenizer, patch_size=patch_size, feat_dim=feat_dim
-        ),
+        stage_payload=payload, state=state, prefill=prefill, req=req
     )
 
 
