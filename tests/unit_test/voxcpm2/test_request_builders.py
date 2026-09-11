@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sglang_omni.models.voxcpm2 import constants as C
@@ -10,6 +11,7 @@ from sglang_omni.models.voxcpm2.hf_config import VoxCPM2RuntimeConfig
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.models.voxcpm2.request_builders import (
     VoxCPM2PreprocessingContext,
+    audio_prefix_fingerprint,
     build_prefill_inputs,
     build_voxcpm2_state,
 )
@@ -122,3 +124,64 @@ def test_zero_shot_prefill_is_text_only():
     prefill = _prefill(state)
     assert prefill.text_mask.tolist() == [1, 1, 1]
     assert prefill.audio_mask.tolist() == [0, 0, 0]
+
+
+def test_empty_text_is_rejected():
+    payload = _FakePayload(_FakeRequest({"text": "  ", "references": []}))
+    with pytest.raises(ValueError, match="nonempty input text"):
+        build_voxcpm2_state(payload, _context())
+
+
+def test_more_than_one_reference_is_rejected():
+    payload = _FakePayload(
+        _FakeRequest(
+            {"text": "hi", "references": [{"audio_path": "a"}, {"audio_path": "b"}]}
+        )
+    )
+    with pytest.raises(ValueError, match="at most one reference"):
+        build_voxcpm2_state(payload, _context())
+
+
+def test_unset_sampling_fields_fall_back_to_the_released_recipe():
+    state = _state_for([])
+    assert state.inference_timesteps == C.DEFAULT_INFERENCE_TIMESTEPS
+    assert state.cfg_value == C.DEFAULT_CFG_VALUE
+    assert state.max_len == C.DEFAULT_MAX_LEN
+    assert state.seed is None
+
+
+def test_caller_supplied_sampling_fields_win():
+    payload = _FakePayload(
+        _FakeRequest(
+            {"text": "hi", "references": []},
+            metadata={"tts_params": {"inference_timesteps": 4, "cfg_value": 1.0}},
+        )
+    )
+    state = build_voxcpm2_state(payload, _context())
+    assert state.inference_timesteps == 4
+    assert state.cfg_value == 1.0
+
+
+def _prefill_with_reference(fill: float):
+    state = VoxCPM2State(text_token=torch.tensor([1, 2], dtype=torch.int32))
+    state.ref_latents = torch.full((3, 4, 64), fill)
+    return _prefill(state)
+
+
+def test_different_reference_audio_gets_a_different_radix_key():
+    """Audio positions share token id 0, so only this key keeps prefixes apart."""
+    first = audio_prefix_fingerprint(_prefill_with_reference(0.25))
+    second = audio_prefix_fingerprint(_prefill_with_reference(0.75))
+    assert first is not None and second is not None
+    assert first != second
+
+
+def test_identical_reference_audio_gets_the_same_radix_key():
+    first = audio_prefix_fingerprint(_prefill_with_reference(0.25))
+    second = audio_prefix_fingerprint(_prefill_with_reference(0.25))
+    assert first == second
+
+
+def test_zero_shot_requests_share_one_radix_subtree():
+    state = VoxCPM2State(text_token=torch.tensor([1, 2], dtype=torch.int32))
+    assert audio_prefix_fingerprint(_prefill(state)) is None
