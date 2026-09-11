@@ -18,12 +18,10 @@ class VoxCPM2State(DeclarativeStateBase):
     out_sample_rate: int = wire(C.OUT_SAMPLE_RATE, codec="int")
 
     prompt_text: str = wire("", codec="str")
-    prompt_wav_path: str = wire("", codec="str")
-    reference_wav_path: str = wire("", codec="str")
+    prompt_audio: str = wire("", codec="str")
+    reference_audio: str = wire("", codec="str")
 
     text_token: Any | None = wire(None, codec="typed_tensor")
-    text_mask: Any | None = wire(None, codec="typed_tensor")
-    audio_mask: Any | None = wire(None, codec="typed_tensor")
     target_text_length: int = wire(0, codec="int")
 
     ref_latents: Any | None = wire(None, codec="typed_tensor")
