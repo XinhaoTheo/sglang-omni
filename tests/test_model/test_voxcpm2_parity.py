@@ -22,10 +22,10 @@ import torch
 
 pytestmark = pytest.mark.accelerator
 
-# note (Xinhao Tan): tolerances are per dtype because bf16 keeps 8 mantissa
-# bits - one ULP at magnitude 8 is already 0.03, so an fp32-sized tolerance
-# reports rounding as a failed port. Seeds are fixed for the same reason a
-# tolerance is: a run has to be comparable to the previous one.
+# note (Xinhao Tan): tolerances are per dtype because bf16 carries 7 explicit
+# mantissa bits, so one ULP at magnitude 16 is already 0.125 and an fp32-sized
+# tolerance reports rounding as a failed port. Seeds are fixed for the same
+# reason a tolerance is: a run has to be comparable to the previous one.
 _TOLERANCE = {
     torch.float32: (1e-4, 1e-4),
     torch.bfloat16: (6e-2, 6e-2),
@@ -37,6 +37,22 @@ _SEED = 1234
 def _seeded(*shape: int, device: str = "cuda:0", dtype=torch.float32):
     torch.manual_seed(_SEED)
     return torch.randn(*shape, device=device, dtype=dtype)
+
+
+def _ulp(reference: torch.Tensor, dtypes: str) -> float:
+    """Spacing between representable values at this tensor's largest magnitude.
+
+    An absolute error in bf16 says nothing on its own; next to the ULP it says
+    whether the two sides landed on neighbouring representable values or
+    genuinely diverged.
+    """
+    mantissa_bits = 7 if "bfloat16" in dtypes else (10 if "float16" in dtypes else 23)
+    peak = float(reference.abs().max())
+    if peak == 0.0:
+        return 0.0
+    import math
+
+    return 2.0 ** (math.floor(math.log2(peak)) - mantissa_bits)
 
 
 def _assert_close(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
@@ -59,8 +75,8 @@ def _assert_close(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
         f"tol=({atol:g},{rtol:g}) "
         f"mismatched={mismatched}/{total} ({100.0 * mismatched / total:.1f}%) "
         f"max_abs={float(difference.max()):.3e} "
-        f"max_rel={float((difference / theirs.abs().clamp_min(1e-6)).max()):.3e} "
-        f"mean_abs={float(difference.mean()):.3e}",
+        f"mean_abs={float(difference.mean()):.3e} "
+        f"peak={float(theirs.abs().max()):.3e} ulp={_ulp(theirs, dtypes):.3e}",
         flush=True,
     )
     torch.testing.assert_close(ours, theirs, atol=atol, rtol=rtol, msg=what)
@@ -212,7 +228,17 @@ def _our_engine_module(ours: dict, name: str):
             mean_mode=config.dit_mean_mode,
         )
 
-    module = load_module(module, ours["checkpoint"], prefix=f"{name}.", device="cuda:0")
+    from sglang_omni.models.voxcpm2.components.minicpm import align_rope_buffers
+    from sglang_omni.models.weight_loader import resolve_dtype
+
+    module = load_module(
+        module,
+        ours["checkpoint"],
+        prefix=f"{name}.",
+        device="cuda:0",
+        dtype=resolve_dtype(config.dtype),
+    )
+    align_rope_buffers(module)
     ours[f"_{name}"] = module
     return module
 

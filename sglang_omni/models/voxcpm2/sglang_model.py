@@ -18,6 +18,7 @@ from sglang_omni.models.voxcpm2.components.local_encoder import VoxCPMLocEnc
 from sglang_omni.models.voxcpm2.components.minicpm import (
     MiniCPM4Config,
     RopeScalingConfig,
+    align_rope_buffers,
 )
 from sglang_omni.models.voxcpm2.components.projections import VoxCPM2Projections
 from sglang_omni.models.weight_loader import default_weight_loader
@@ -292,6 +293,8 @@ class VoxCPM2SGLangModel(nn.Module):
             loader = getattr(parameter, "weight_loader", default_weight_loader)
             loader(parameter, tensor)
             loaded.add(target)
+        align_rope_buffers(self.feat_encoder)
+        align_rope_buffers(self.feat_decoder)
         return loaded
 
 

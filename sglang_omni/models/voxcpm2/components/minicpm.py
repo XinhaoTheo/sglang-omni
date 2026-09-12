@@ -117,6 +117,16 @@ class MiniCPMLongRoPE(nn.Module):
         return self.cos_cached[position_ids], self.sin_cached[position_ids]
 
 
+def align_rope_buffers(module: nn.Module) -> None:
+    """Match upstream's model-wide cast for non-persistent RoPE buffers."""
+    parameter = next(module.parameters())
+    for child in module.modules():
+        if isinstance(child, MiniCPMLongRoPE):
+            # Build the tables in FP32 first, then cast them just as upstream
+            # does after loading. These buffers are absent from state_dict.
+            child.to(device=parameter.device, dtype=parameter.dtype)
+
+
 class MiniCPMAttention(nn.Module):
     def __init__(self, config: MiniCPM4Config):
         super().__init__()
