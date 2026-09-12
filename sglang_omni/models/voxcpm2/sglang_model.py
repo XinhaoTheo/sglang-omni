@@ -43,16 +43,6 @@ def _local_config(lm_config: Any, overrides: dict[str, Any]) -> MiniCPM4Config:
     )
 
 
-class _NoRope(nn.Module):
-    """Stands in for a rotary embedding on the residual stack's layers."""
-
-    def forward(
-        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del positions
-        return q, k
-
-
 def _stack_config(base: Any, *, num_layers: int) -> Any:
     """Copy an HF config for one stack, neutralizing SGLang's muP depth scaling."""
     config = base.__class__(**base.to_dict()) if hasattr(base, "to_dict") else base
@@ -113,7 +103,11 @@ class VoxCPM2SGLangModel(nn.Module):
                 prefix=f"{prefix}.residual_lm.layers.{index}",
             )
             if voxcpm_config.get("residual_lm_no_rope", False):
-                layer.self_attn.rotary_emb = _NoRope()
+                # note (Xinhao Tan): SGLang's MiniCPM attention carries an
+                # attn_use_rope switch, but MiniCPMDecoderLayer only reads it
+                # off a MiniCPMHybridConfig and hardcodes True otherwise, so
+                # the residual stack has to set it after construction.
+                layer.self_attn.attn_use_rope = False
             layers.append(layer)
         self.layers = nn.ModuleList(layers)
 
