@@ -22,15 +22,48 @@ import torch
 
 pytestmark = pytest.mark.accelerator
 
-_ATOL = 2e-3
-_RTOL = 2e-3
+# note (Xinhao Tan): tolerances are per dtype because bf16 keeps 8 mantissa
+# bits - one ULP at magnitude 8 is already 0.03, so an fp32-sized tolerance
+# reports rounding as a failed port. Seeds are fixed for the same reason a
+# tolerance is: a run has to be comparable to the previous one.
+_TOLERANCE = {
+    torch.float32: (1e-4, 1e-4),
+    torch.bfloat16: (6e-2, 6e-2),
+    torch.float16: (1e-2, 1e-2),
+}
+_SEED = 1234
+
+
+def _seeded(*shape: int, device: str = "cuda:0", dtype=torch.float32):
+    torch.manual_seed(_SEED)
+    return torch.randn(*shape, device=device, dtype=dtype)
 
 
 def _assert_close(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
+    """Compare and report the deltas, so a passing run still yields numbers.
+
+    The mismatch count separates a rounding difference from a wrong port: a
+    handful of outliers is precision, most of the tensor is a real divergence.
+    """
+    atol, rtol = _TOLERANCE.get(theirs.dtype, (1e-4, 1e-4))
+    dtypes = f"{ours.dtype}/{theirs.dtype}"
     ours = ours.detach().float().cpu()
     theirs = theirs.detach().float().cpu()
     assert ours.shape == theirs.shape, f"{what}: {ours.shape} vs {theirs.shape}"
-    torch.testing.assert_close(ours, theirs, atol=_ATOL, rtol=_RTOL, msg=what)
+
+    difference = (ours - theirs).abs()
+    mismatched = int((difference > atol + rtol * theirs.abs()).sum())
+    total = int(difference.numel())
+    print(
+        f"[parity] {what}: shape={tuple(ours.shape)} dtypes={dtypes} "
+        f"tol=({atol:g},{rtol:g}) "
+        f"mismatched={mismatched}/{total} ({100.0 * mismatched / total:.1f}%) "
+        f"max_abs={float(difference.max()):.3e} "
+        f"max_rel={float((difference / theirs.abs().clamp_min(1e-6)).max()):.3e} "
+        f"mean_abs={float(difference.mean()):.3e}",
+        flush=True,
+    )
+    torch.testing.assert_close(ours, theirs, atol=atol, rtol=rtol, msg=what)
 
 
 @pytest.fixture(scope="module")
@@ -68,32 +101,34 @@ def parity_models():
 def test_audio_vae_encode_matches_upstream(parity_models):
     upstream, ours = parity_models
     sample_rate = ours["config"].sample_rate
-    waveform = torch.randn(1, 1, sample_rate, device="cuda:0")
+    waveform = _seeded(1, 1, sample_rate)
 
-    theirs = upstream.audio_vae.encode(waveform, sample_rate)
-    mine = ours["audio_vae"].encode(waveform, sample_rate)
+    with torch.inference_mode():
+        theirs = upstream.audio_vae.encode(waveform, sample_rate)
+        mine = ours["audio_vae"].encode(waveform, sample_rate)
     _assert_close(mine, theirs, "AudioVAE encode")
 
 
 def test_audio_vae_decode_matches_upstream(parity_models):
     upstream, ours = parity_models
     latent_dim = ours["config"].latent_dim
-    latents = torch.randn(1, latent_dim, 32, device="cuda:0")
+    latents = _seeded(1, latent_dim, 32)
 
-    theirs = upstream.audio_vae.decode(latents)
-    mine = ours["audio_vae"].decode(latents)
+    with torch.inference_mode():
+        theirs = upstream.audio_vae.decode(latents)
+        mine = ours["audio_vae"].decode(latents)
     _assert_close(mine, theirs, "AudioVAE decode")
 
 
 def test_local_encoder_matches_upstream(parity_models):
     upstream, ours = parity_models
     config = ours["config"]
-    patches = torch.randn(1, 3, config.patch_size, config.feat_dim, device="cuda:0").to(
-        next(upstream.feat_encoder.parameters()).dtype
-    )
+    dtype = next(upstream.feat_encoder.parameters()).dtype
+    patches = _seeded(1, 3, config.patch_size, config.feat_dim).to(dtype)
 
-    theirs = upstream.feat_encoder(patches)
-    mine = _our_engine_module(ours, "feat_encoder")(patches)
+    with torch.inference_mode():
+        theirs = upstream.feat_encoder(patches)
+        mine = _our_engine_module(ours, "feat_encoder")(patches)
     _assert_close(mine, theirs, "local encoder")
 
 
@@ -103,14 +138,15 @@ def test_local_dit_matches_upstream(parity_models):
     dtype = next(upstream.feat_decoder.parameters()).dtype
     dit_hidden = config.dit["hidden_dim"] * 2
 
-    x = torch.randn(1, config.feat_dim, config.patch_size, device="cuda:0", dtype=dtype)
-    mu = torch.randn(1, dit_hidden, device="cuda:0", dtype=dtype)
-    cond = torch.randn_like(x)
-    t = torch.rand(1, device="cuda:0", dtype=dtype)
+    x = _seeded(1, config.feat_dim, config.patch_size, dtype=dtype)
+    mu = _seeded(1, dit_hidden, dtype=dtype)
+    cond = _seeded(1, config.feat_dim, config.patch_size, dtype=dtype)
+    t = torch.full((1,), 0.5, device="cuda:0", dtype=dtype)
     dt = torch.zeros_like(t)
 
-    theirs = upstream.feat_decoder.estimator(x, mu, t, cond, dt)
-    mine = _our_engine_module(ours, "feat_decoder").estimator(x, mu, t, cond, dt)
+    with torch.inference_mode():
+        theirs = upstream.feat_decoder.estimator(x, mu, t, cond, dt)
+        mine = _our_engine_module(ours, "feat_decoder").estimator(x, mu, t, cond, dt)
     _assert_close(mine, theirs, "local DiT")
 
 
@@ -121,19 +157,26 @@ def test_flow_sampler_matches_upstream(parity_models):
     dtype = next(upstream.feat_decoder.parameters()).dtype
     dit_hidden = config.dit["hidden_dim"] * 2
 
-    mu = torch.randn(1, dit_hidden, device="cuda:0", dtype=dtype)
-    cond = torch.randn(
-        1, config.feat_dim, config.patch_size, device="cuda:0", dtype=dtype
-    )
+    mu = _seeded(1, dit_hidden, dtype=dtype)
+    cond = _seeded(1, config.feat_dim, config.patch_size, dtype=dtype)
 
-    torch.manual_seed(1234)
-    theirs = upstream.feat_decoder(
-        mu=mu, n_timesteps=10, patch_size=config.patch_size, cond=cond, cfg_value=2.0
-    )
-    torch.manual_seed(1234)
-    mine = _our_engine_module(ours, "feat_decoder")(
-        mu=mu, n_timesteps=10, patch_size=config.patch_size, cond=cond, cfg_value=2.0
-    )
+    with torch.inference_mode():
+        torch.manual_seed(_SEED)
+        theirs = upstream.feat_decoder(
+            mu=mu,
+            n_timesteps=10,
+            patch_size=config.patch_size,
+            cond=cond,
+            cfg_value=2.0,
+        )
+        torch.manual_seed(_SEED)
+        mine = _our_engine_module(ours, "feat_decoder")(
+            mu=mu,
+            n_timesteps=10,
+            patch_size=config.patch_size,
+            cond=cond,
+            cfg_value=2.0,
+        )
     _assert_close(mine, theirs, "flow-matching sampler")
 
 
