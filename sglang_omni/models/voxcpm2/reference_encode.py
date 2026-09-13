@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.models.voxcpm2.components.audio_vae import AudioVAE
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.preprocessing.cache_key import reference_path_cache_key
@@ -72,6 +73,20 @@ class VoxCPM2ReferenceEncoder:
                 max_bytes=cache_max_bytes,
                 log_prefix="VoxCPM2 ref cache",
             )
+
+    def warmup(self) -> None:
+        """Warm up the audio encoder before accepting requests.
+
+        note (Xinhao Tan): TorchScript optimizes the encoder's Snake activation
+        after its initial calls, which can change floating-point results.
+        Small differences in encoded reference audio can affect the entire
+        generated utterance. Run dummy audio through the encoder at startup
+        so the first request also uses the warmed-up computation.
+        """
+        patch_len = self.patch_size * self._audio_vae.hop_length
+        waveform = torch.zeros((1, patch_len), device=self.device, dtype=torch.float32)
+        for _ in range(C.WARMUP_ITERATIONS):
+            self._audio_vae.encode(waveform, self.sample_rate)
 
     def encode_audio(self, source: str, *, padding_side: str) -> torch.Tensor:
         """Encode one audio source into ``[frames, patch_size, latent_dim]``."""

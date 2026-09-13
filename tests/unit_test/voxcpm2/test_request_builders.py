@@ -276,6 +276,42 @@ def test_more_than_one_reference_is_rejected():
         build_voxcpm2_state(payload, _context())
 
 
+def test_a_reference_without_audio_is_rejected():
+    """Silently answering in an unrelated voice is the worse failure here."""
+    payload = _FakePayload(
+        _FakeRequest({"text": "hi", "references": [{"text": "a transcript"}]})
+    )
+    with pytest.raises(ValueError, match="reference audio is missing"):
+        build_voxcpm2_state(payload, _context())
+
+
+def test_an_empty_reference_source_is_rejected():
+    payload = _FakePayload(
+        _FakeRequest({"text": "hi", "references": [{"audio_path": ""}]})
+    )
+    with pytest.raises(ValueError, match="reference audio is missing"):
+        build_voxcpm2_state(payload, _context())
+
+
+def test_ref_text_without_reference_audio_is_rejected():
+    payload = _FakePayload(
+        _FakeRequest(
+            {"text": "hi", "references": []},
+            metadata={"tts_params": {"ref_text": "a transcript"}},
+        )
+    )
+    with pytest.raises(ValueError, match="without reference audio"):
+        build_voxcpm2_state(payload, _context())
+
+
+def test_no_reference_at_all_is_still_a_valid_zero_shot_request():
+    """The rejection must not swallow the mode the endpoint uses by default."""
+    state = _state_for([])
+    assert state.reference_audio == ""
+    assert state.prompt_audio == ""
+    assert state.prompt_text == ""
+
+
 def test_unset_sampling_fields_fall_back_to_the_released_recipe():
     state = _state_for([])
     assert state.inference_timesteps == C.DEFAULT_INFERENCE_TIMESTEPS

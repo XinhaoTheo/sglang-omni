@@ -68,6 +68,23 @@ class VoxCPM2StreamingVocoder(StreamingVocoderBase[_StreamState, None]):
             max_batch_size=max_batch_size,
         )
 
+    def warmup_now(self) -> None:
+        """Warm up the audio decoder before accepting requests.
+
+        note (Xinhao Tan): TorchScript optimizes the decoder's Snake activation
+        after its initial calls, which can change floating-point results.
+        Identical audio latents can then decode to different waveforms before
+        and after warmup. Decode dummy latents at startup so the first request
+        also uses the warmed-up computation.
+        """
+        latents = torch.zeros(
+            (1, self._vae.latent_dim, self._patch_size * self._stride),
+            device=self._device,
+            dtype=torch.float32,
+        )
+        for _ in range(C.WARMUP_ITERATIONS):
+            self._vae.decode(latents)
+
     def create_stream_state(self, request_id: str) -> _StreamState:
         del request_id
         return _StreamState()

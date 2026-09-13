@@ -88,9 +88,23 @@ def build_voxcpm2_state(
         else {}
     )
     source = _reference_source(reference)
+    # note (Xinhao Tan): a reference carrying no audio cannot be reported later
+    # without guessing. Downstream it either loads nothing and the request is
+    # answered in some unrelated voice, or the encode stage fails on the path
+    # and the caller gets a 500 for what is their own malformed input.
+    if reference and not source:
+        raise ValueError(
+            "VoxCPM2 reference audio is missing: a reference must carry one of "
+            "audio_path, path, url, or inline audio data"
+        )
     reference_text = str(
         reference.get("text") or tts_params.get("ref_text") or ""
     ).strip()
+    if reference_text and not source:
+        raise ValueError(
+            "VoxCPM2 ref_text was given without reference audio: the transcript "
+            "only selects the cloning mode, it cannot clone on its own"
+        )
 
     # note (Xinhao Tan): upstream picks the cloning mode based on whether the
     # reference audio has a transcript. With one, the model continues from the

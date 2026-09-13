@@ -97,6 +97,7 @@ def create_reference_encode_executor(
         patch_size=config.patch_size,
         cache_model_identity=str(model_path),
     )
+    encoder.warmup()
     return SimpleScheduler(encoder.encode_payload, max_concurrency=max_concurrency)
 
 
@@ -144,7 +145,7 @@ def create_vocoder_executor(
 
     checkpoint, config = _resolved(model_path)
     worker_device = device if gpu_id is None else f"{device}:{gpu_id}"
-    return VoxCPM2StreamingVocoder(
+    vocoder = VoxCPM2StreamingVocoder(
         _load_audio_vae(checkpoint, config, device=worker_device),
         device=worker_device,
         patch_size=config.patch_size,
@@ -153,6 +154,8 @@ def create_vocoder_executor(
         overlap_patches=overlap_patches,
         max_batch_size=max_batch_size,
     )
+    vocoder.warmup_now()
+    return vocoder
 
 
 __all__ = [
