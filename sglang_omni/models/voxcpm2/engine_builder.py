@@ -17,6 +17,9 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
     """Builds the SGLang engine that runs VoxCPM2's two AR stacks."""
 
     model_name = "voxcpm2"
+    # note (Xinhao Tan): the shared builder needs an explicit context limit;
+    # use the checkpoint's max_length for the combined text/audio sequence.
+    context_length = 8192
 
     def __init__(
         self,
@@ -46,6 +49,37 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
             checkpoint_dir, trust_remote_code=True
         )
 
+    def resolve_checkpoint(self, model_path: str) -> str:
+        from sglang_omni.models.voxcpm2.hf_config import stage_checkpoint_for_autoconfig
+
+        return stage_checkpoint_for_autoconfig(super().resolve_checkpoint(model_path))
+
+    def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
+        return {
+            # note (Xinhao Tan): the runner builds full-prompt embeddings and
+            # masks, but a radix hit schedules only the uncached suffix.
+            # Prefix reuse is unsupported until those layouts are reconciled.
+            "disable_radix_cache": True,
+            "disable_cuda_graph": True,
+            "disable_overlap_schedule": True,
+            "enable_torch_compile": False,
+            "max_running_requests": self.max_running_requests,
+            "chunked_prefill_size": 0,
+            "mem_fraction_static": 0.60,
+            "dtype": dtype,
+            "trust_remote_code": True,
+        }
+
+    def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        requested = int(
+            overrides.get("max_running_requests", self.max_running_requests)
+        )
+        if requested <= 0:
+            raise ValueError("VoxCPM2 max_running_requests must be positive")
+        self.max_running_requests = requested
+        if not bool(overrides.get("disable_cuda_graph", True)):
+            overrides["enable_return_hidden_states"] = True
+
     def setup_model(
         self,
         *,
@@ -57,9 +91,12 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
     ) -> None:
         del checkpoint_dir, device, gpu_id
         if not getattr(server_args, "disable_cuda_graph", False):
-            model_worker.model_runner.model.enable_graph_feedback(
-                self.max_running_requests
+            capacity = max(
+                self.max_running_requests,
+                getattr(server_args, "cuda_graph_max_bs", None) or 1,
+                max(getattr(server_args, "cuda_graph_bs", None) or [1]),
             )
+            model_worker.model_runner.model.enable_graph_feedback(capacity)
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang_omni.models.voxcpm2.model_runner import VoxCPM2ModelRunner

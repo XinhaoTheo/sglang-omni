@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VoxCPM2 checkpoint config: runtime view and the flattened SGLang view."""
+"""VoxCPM2 checkpoint configuration and staging for SGLang."""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from sglang_omni.models.voxcpm2.hf_config import VoxCPM2Config, load_voxcpm2_config
+from sglang_omni.models.voxcpm2.hf_config import (
+    VOXCPM2_MODEL_TYPE,
+    VoxCPM2Config,
+    load_voxcpm2_config,
+    stage_checkpoint_for_autoconfig,
+)
 
 _LM_CONFIG = {
     "hidden_size": 2048,
@@ -23,6 +29,7 @@ _LM_CONFIG = {
     "scale_depth": 1.4,
     "kv_channels": 128,
 }
+
 
 _CONFIG = {
     "architecture": "voxcpm2",
@@ -89,3 +96,55 @@ def test_sub_config_name_stays_off_sglangs_text_config_lookup():
     config = VoxCPM2Config(lm_config=_LM_CONFIG, voxcpm2_config=_CONFIG)
     for claimed in ("text_config", "llm_config", "language_config", "thinker_config"):
         assert not hasattr(config, claimed)
+
+
+def _checkpoint(root: Path, *, model_type: str | None = None) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    config = {"architecture": "voxcpm2", "lm_config": {"num_hidden_layers": 2}}
+    if model_type is not None:
+        config["model_type"] = model_type
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (root / "model.safetensors").write_bytes(b"weights")
+    (root / "audiovae.pth").write_bytes(b"vae")
+    return root
+
+
+def test_a_checkpoint_that_already_declares_its_type_is_used_as_is(tmp_path):
+    root = _checkpoint(tmp_path / "snap", model_type=VOXCPM2_MODEL_TYPE)
+    assert stage_checkpoint_for_autoconfig(str(root)) == str(root)
+
+
+def test_staging_adds_the_model_type_without_touching_the_snapshot(tmp_path):
+    root = _checkpoint(tmp_path / "snap")
+    staged = Path(stage_checkpoint_for_autoconfig(str(root)))
+
+    assert staged != root
+    assert json.loads((staged / "config.json").read_text())["model_type"] == (
+        VOXCPM2_MODEL_TYPE
+    )
+    assert "model_type" not in json.loads((root / "config.json").read_text())
+
+
+def test_the_weights_are_linked_rather_than_copied(tmp_path):
+    root = _checkpoint(tmp_path / "snap")
+    staged = Path(stage_checkpoint_for_autoconfig(str(root)))
+
+    assert (staged / "model.safetensors").is_symlink()
+    assert (staged / "model.safetensors").read_bytes() == b"weights"
+    assert (staged / "audiovae.pth").is_symlink()
+
+
+def test_staging_twice_is_idempotent(tmp_path):
+    root = _checkpoint(tmp_path / "snap")
+    first = stage_checkpoint_for_autoconfig(str(root))
+    assert stage_checkpoint_for_autoconfig(str(root)) == first
+
+
+def test_a_dangling_link_left_behind_does_not_break_staging(tmp_path):
+    """exists() follows a link, so a broken one reads as absent."""
+    root = _checkpoint(tmp_path / "snap")
+    staged = tmp_path / "snap-sglang-omni"
+    staged.mkdir()
+    (staged / "model.safetensors").symlink_to(tmp_path / "gone")
+
+    assert stage_checkpoint_for_autoconfig(str(root)) == str(staged)

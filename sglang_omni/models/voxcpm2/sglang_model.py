@@ -17,6 +17,8 @@ from sglang_omni.models.voxcpm2.components.local_dit import VoxCPMLocDiT
 from sglang_omni.models.voxcpm2.components.local_encoder import VoxCPMLocEnc
 from sglang_omni.models.voxcpm2.components.minicpm import (
     MiniCPM4Config,
+    MiniCPMRMSNorm,
+    MiniCPMSiluAndMul,
     RopeScalingConfig,
     align_rope_buffers,
 )
@@ -24,10 +26,38 @@ from sglang_omni.models.voxcpm2.components.projections import VoxCPM2Projections
 from sglang_omni.models.weight_loader import default_weight_loader
 
 
+def _rope_settings(lm_config: Any) -> tuple[float, RopeScalingConfig]:
+    """Read the rope settings from either shape this config arrives in.
+
+    note (Xinhao Tan): transformers 5 folds rope_theta and rope_scaling into a
+    single rope_parameters dict, so a config that came through AutoConfig has
+    neither of the two original fields. The checkpoint's own JSON still has
+    them, and the parity test builds its config straight from that JSON, so
+    both shapes reach this function and dropping either one breaks a path that
+    the other path's tests would not catch.
+    """
+    parameters = getattr(lm_config, "rope_parameters", None)
+    if parameters:
+        parameters = dict(parameters)
+        theta = float(parameters["rope_theta"])
+        scaling = parameters
+    else:
+        theta = float(lm_config.rope_theta)
+        scaling = lm_config.rope_scaling
+        scaling = scaling if isinstance(scaling, dict) else scaling.to_dict()
+    return theta, RopeScalingConfig(
+        type=str(scaling.get("type") or scaling["rope_type"]),
+        long_factor=list(scaling["long_factor"]),
+        short_factor=list(scaling["short_factor"]),
+        original_max_position_embeddings=int(
+            scaling["original_max_position_embeddings"]
+        ),
+    )
+
+
 def _local_config(lm_config: Any, overrides: dict[str, Any]) -> MiniCPM4Config:
     """Build a local encoder / DiT config the way upstream derives it from the LM."""
-    rope = lm_config.rope_scaling
-    rope = rope if isinstance(rope, dict) else rope.to_dict()
+    rope_theta, rope_scaling = _rope_settings(lm_config)
     return MiniCPM4Config(
         hidden_size=int(overrides["hidden_dim"]),
         intermediate_size=int(overrides["ffn_dim"]),
@@ -36,8 +66,8 @@ def _local_config(lm_config: Any, overrides: dict[str, Any]) -> MiniCPM4Config:
         num_hidden_layers=int(overrides["num_layers"]),
         num_key_value_heads=int(lm_config.num_key_value_heads),
         rms_norm_eps=float(lm_config.rms_norm_eps),
-        rope_theta=float(lm_config.rope_theta),
-        rope_scaling=RopeScalingConfig(**rope),
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
         scale_depth=float(lm_config.scale_depth),
         use_mup=bool(getattr(lm_config, "use_mup", False)),
         kv_channels=overrides.get("kv_channels"),
@@ -112,12 +142,41 @@ class VoxCPM2SGLangModel(nn.Module):
             layers.append(layer)
         self.layers = nn.ModuleList(layers)
 
+        # note (Xinhao Tan): upstream rounds RMSNorm and SiLU intermediates to
+        # model dtype before multiplication. Fusing across these rounding steps
+        # changes the values reaching FSQ, so these operations must preserve
+        # upstream's rounding order.
+        for layer in self.layers:
+            layer.input_layernorm = MiniCPMRMSNorm(
+                int(lm_config.hidden_size), eps=float(lm_config.rms_norm_eps)
+            )
+            layer.post_attention_layernorm = MiniCPMRMSNorm(
+                int(lm_config.hidden_size), eps=float(lm_config.rms_norm_eps)
+            )
+            layer.mlp.act_fn = MiniCPMSiluAndMul()
+
         hidden_size = int(lm_config.hidden_size)
         eps = float(lm_config.rms_norm_eps)
-        from sglang.srt.layers.layernorm import RMSNorm
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-        self.base_norm = RMSNorm(hidden_size, eps=eps)
-        self.residual_norm = RMSNorm(hidden_size, eps=eps)
+        self.embed_tokens = VocabParallelEmbedding(
+            int(lm_config.vocab_size),
+            hidden_size,
+            prefix=(
+                f"{prefix}.base_lm.embed_tokens" if prefix else "base_lm.embed_tokens"
+            ),
+        )
+        # note (Xinhao Tan): upstream multiplies the token embedding by
+        # scale_emb only when use_mup is set, and VoxCPM2 ships it false, so
+        # this is 1.0 for the released checkpoint rather than the config's 12.
+        self.scale_emb = (
+            float(getattr(lm_config, "scale_emb", 1.0))
+            if bool(getattr(lm_config, "use_mup", False))
+            else 1.0
+        )
+
+        self.base_norm = MiniCPMRMSNorm(hidden_size, eps=eps)
+        self.residual_norm = MiniCPMRMSNorm(hidden_size, eps=eps)
 
         encoder_config = _local_config(lm_config, voxcpm_config["encoder_config"])
         dit_config = _local_config(lm_config, voxcpm_config["dit_config"])
@@ -197,6 +256,7 @@ class VoxCPM2SGLangModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: Any,
         input_embeds: torch.Tensor | None = None,
+        audio_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> LogitsProcessorOutput:
         """Run both stacks for one step and stash what the decode head needs."""
@@ -210,21 +270,78 @@ class VoxCPM2SGLangModel(nn.Module):
             input_embeds = forward_batch.input_embeds
 
         lm_hidden = self.forward_base(input_embeds, positions, forward_batch)
-        lm_hidden = self.projections.quantize(lm_hidden)
+        if forward_batch.forward_mode.is_extend() and audio_mask is None:
+            raise RuntimeError("VoxCPM2 prefill requires an audio_mask")
+        quantized = self.projections.quantize(lm_hidden)
+        if audio_mask is None:
+            lm_hidden = quantized
+            audio_embed = input_embeds
+        else:
+            mask = audio_mask.to(device=lm_hidden.device, dtype=lm_hidden.dtype)
+            mask = mask.unsqueeze(-1)
+            lm_hidden = quantized * mask + lm_hidden * (1 - mask)
+            audio_embed = input_embeds * mask
+        residual_inputs = self.projections.fuse(lm_hidden, audio_embed)
         residual_hidden = self.forward_residual(
-            self.projections.fuse(lm_hidden, input_embeds), positions, forward_batch
+            residual_inputs, positions, forward_batch
         )
         self._last_lm_hidden = lm_hidden
         self._last_residual_hidden = residual_hidden
 
         # note (Xinhao Tan): VoxCPM2 never samples a token - the runner reads
         # the stashed hidden states and overwrites next_token_ids - so these
-        # logits exist only to satisfy the return contract.
-        request_count = int(lm_hidden.shape[0])
+        # logits exist only to satisfy the return contract. Prefill stashes one
+        # row per position, so the row count is the request count only on
+        # decode; using it on prefill hands the sampler one row per token.
+        if forward_batch.forward_mode.is_extend():
+            extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+            request_count = (
+                int(extend_seq_lens.numel()) if extend_seq_lens is not None else 1
+            )
+        else:
+            request_count = int(lm_hidden.shape[0])
         return LogitsProcessorOutput(
             next_token_logits=lm_hidden.new_empty((request_count, 1)),
-            hidden_states=lm_hidden,
+            # CUDA graph replay updates tensors, not Python attribute assignments.
+            # Return both stacks so the runner reads this replay's output instead
+            # of the tensors last assigned during capture or a previous prefill.
+            hidden_states=torch.cat((lm_hidden, residual_hidden), dim=-1),
         )
+
+    def set_hidden_states(self, hidden: torch.Tensor) -> None:
+        width = int(self.config.lm_config.hidden_size)
+        if (
+            not isinstance(hidden, torch.Tensor)
+            or hidden.ndim != 2
+            or hidden.shape[1] != 2 * width
+        ):
+            raise RuntimeError("VoxCPM2 forward must return both AR hidden states")
+        self._last_lm_hidden, self._last_residual_hidden = hidden.split(width, dim=-1)
+
+    @torch.inference_mode()
+    def build_input_embeds(
+        self,
+        text_token: torch.Tensor,
+        audio_feat: torch.Tensor,
+        text_mask: torch.Tensor,
+        audio_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine token and latent positions into one embedding sequence.
+
+        Every position carries exactly one of the two, chosen by the masks, so
+        the sum is a selection rather than a blend.
+        """
+        parameter = next(self.parameters())
+        device, dtype = parameter.device, parameter.dtype
+
+        text_embed = self.embed_tokens(text_token.to(device)) * self.scale_emb
+        patch_embed = self.projections.enc_to_lm_proj(
+            self.feat_encoder(audio_feat.to(device=device, dtype=dtype).unsqueeze(0))
+        )[0]
+
+        text_mask = text_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+        audio_mask = audio_mask.to(device=device, dtype=dtype).unsqueeze(-1)
+        return text_mask * text_embed.to(dtype) + audio_mask * patch_embed
 
     def _rows(self, rows: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         """Select one hidden row per request from the last forward.
@@ -246,6 +363,7 @@ class VoxCPM2SGLangModel(nn.Module):
         inference_timesteps: int,
         cfg_value: float,
         rows: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample one latent patch and fold it back into the next step embedding.
 
@@ -260,6 +378,7 @@ class VoxCPM2SGLangModel(nn.Module):
             patch_size=self.patch_size,
             cond=cond.transpose(1, 2).contiguous(),
             cfg_value=float(cfg_value),
+            noise=noise,
         ).transpose(1, 2)
         embedding = self.projections.enc_to_lm_proj(
             self.feat_encoder(patch.unsqueeze(1))
@@ -277,13 +396,35 @@ class VoxCPM2SGLangModel(nn.Module):
             raise RuntimeError("VoxCPM2 graph feedback buffer is not enabled")
         self._graph_feedback_buffer[: embedding.shape[0]].copy_(embedding)
 
+    # note (Xinhao Tan): SGLang fuses the attention and MLP projections, so the
+    # checkpoint's separate q/k/v and gate/up tensors each load into one shard
+    # of a merged parameter. Without this the names resolve to parameters the
+    # model genuinely does not have.
+    _STACKED_PARAMS = (
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
+    )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
+        loaded_shards: dict[str, set[str | int | None]] = {}
         for name, tensor in weights:
             target = _map_checkpoint_name(name, self.num_base_layers)
             if target is None:
                 continue
+
+            shard_id = None
+            if target.startswith("layers."):
+                for fused, separate, shard in self._STACKED_PARAMS:
+                    if separate in target:
+                        target = target.replace(separate, fused)
+                        shard_id = shard
+                        break
+
             parameter = params.get(target)
             if parameter is None:
                 raise ValueError(
@@ -291,8 +432,32 @@ class VoxCPM2SGLangModel(nn.Module):
                     "which the AR model does not define"
                 )
             loader = getattr(parameter, "weight_loader", default_weight_loader)
-            loader(parameter, tensor)
+            if shard_id is None:
+                loader(parameter, tensor)
+            else:
+                loader(parameter, tensor, shard_id)
             loaded.add(target)
+            loaded_shards.setdefault(target, set()).add(shard_id)
+        # note (Xinhao Tan): a parameter the checkpoint never reaches keeps its
+        # random init and still produces audio, just the wrong audio. The name
+        # mapping is hand-written and the fused projections make it easy to
+        # miss one, so the load says so rather than leaving it to listening.
+        missing = sorted(set(params) - loaded)
+        if missing:
+            raise ValueError(
+                f"VoxCPM2 checkpoint left {len(missing)} parameters at their "
+                f"initial values, starting with {missing[:5]}"
+            )
+        for target, shards in loaded_shards.items():
+            if None in shards:
+                continue
+            expected = {"q", "k", "v"} if ".qkv_proj." in target else {0, 1}
+            missing_shards = expected - shards
+            if missing_shards:
+                raise ValueError(
+                    f"VoxCPM2 checkpoint left {target!r} without shards "
+                    f"{sorted(missing_shards)}"
+                )
         align_rope_buffers(self.feat_encoder)
         align_rope_buffers(self.feat_decoder)
         return loaded
@@ -317,6 +482,8 @@ def _map_checkpoint_name(name: str, num_base_layers: int) -> str | None:
         rest = name.removeprefix("residual_lm.layers.")
         index, _, tail = rest.partition(".")
         return f"layers.{num_base_layers + int(index)}.{tail}"
+    if name == "base_lm.embed_tokens.weight":
+        return "embed_tokens.weight"
     if name == "base_lm.norm.weight":
         return "base_norm.weight"
     if name == "residual_lm.norm.weight":

@@ -9,6 +9,10 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.model_runner.prefill_inputs import (
+    OmniPrefillInputs,
+    attach_omni_prefill_inputs,
+)
 from sglang_omni.models.voxcpm2.request_builders import VoxCPM2SGLangRequestData
 
 
@@ -33,19 +37,85 @@ class VoxCPM2ModelRunner(ModelRunner):
             return CaptureHiddenMode.FULL
         return CaptureHiddenMode.LAST
 
+    def before_prefill(
+        self, forward_batch: Any, schedule_batch: Any, requests: list
+    ) -> None:
+        """Turn each request's prefill layout into the embedding sequence.
+
+        The AR stacks read continuous embeddings, not token ids: text positions
+        come from the token table and audio positions from the local encoder,
+        so nothing upstream of the model can produce this tensor.
+        """
+        del schedule_batch
+        if not requests:
+            return
+        embeds = []
+        for request in requests:
+            prefill = request.data.prefill
+            # note (Xinhao Tan): embeddings and masks cover the full prompt,
+            # but a radix hit would schedule only its uncached suffix.
+            reused = len(request.data.req.prefix_indices)
+            if reused:
+                raise RuntimeError(
+                    "VoxCPM2 does not support radix prefix reuse: "
+                    f"{reused} positions were reused"
+                )
+            embeds.append(
+                self.model.build_input_embeds(
+                    prefill.text_token,
+                    prefill.audio_feat,
+                    prefill.text_mask,
+                    prefill.audio_mask,
+                )
+            )
+        attach_omni_prefill_inputs(
+            forward_batch,
+            OmniPrefillInputs(
+                input_embeds=torch.cat(embeds, dim=0),
+                audio_mask=torch.cat(
+                    [request.data.prefill.audio_mask for request in requests], dim=0
+                ),
+            ),
+        )
+
+    def before_decode(
+        self,
+        forward_batch: Any,
+        schedule_batch: Any,
+        requests: list,
+        *,
+        is_lookahead: bool = False,
+    ) -> None:
+        """Hand the step its input: the embedding the previous step produced.
+
+        A captured graph reads the model's own buffer, but the eager path reads
+        forward_batch, so the embedding has to reach both.
+        """
+        del schedule_batch, is_lookahead
+        embeds = [request.data.next_embed for request in requests]
+        if not embeds or any(embed is None for embed in embeds):
+            return
+        stacked = torch.stack(embeds, dim=0)
+        if self.model.graph_feedback_buffer is not None:
+            self.model.write_feedback(stacked)
+        else:
+            forward_batch.input_embeds = stacked
+
     def post_prefill(
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
-        del result, forward_batch
+        del forward_batch
         if bool(getattr(schedule_batch, "is_prefill_only", False)) or not requests:
             return
+        self.model.set_hidden_states(result.logits_output.hidden_states)
         self._advance(requests, rows=self._prefill_rows(requests), is_prefill=True)
 
     def post_decode(
         self, result: Any, forward_batch: Any, schedule_batch: Any, requests: list
     ) -> None:
-        del result, forward_batch, schedule_batch
+        del forward_batch, schedule_batch
         if requests:
+            self.model.set_hidden_states(result.logits_output.hidden_states)
             self._advance(requests, rows=None, is_prefill=False)
 
     @staticmethod
@@ -63,33 +133,61 @@ class VoxCPM2ModelRunner(ModelRunner):
     ) -> None:
         """Sample one latent patch per request and stage the next step's input."""
         rows_data = [request.data for request in requests]
-        timesteps, cfg_value = _shared_sampling(rows_data)
+        if rows is None:
+            rows = torch.arange(len(rows_data), dtype=torch.long)
 
-        patches, embeddings = self.model.decode_patch(
-            self._batch_cond(rows_data),
-            inference_timesteps=timesteps,
-            cfg_value=cfg_value,
-            rows=rows,
-        )
+        patches: list[Any] = [None] * len(rows_data)
+        embeddings: list[Any] = [None] * len(rows_data)
+        for group in _recipe_groups(rows_data):
+            group_data = [rows_data[index] for index in group]
+            group_patches, group_embeddings = self.model.decode_patch(
+                self._batch_cond(group_data),
+                inference_timesteps=int(group_data[0].state.inference_timesteps),
+                cfg_value=float(group_data[0].state.cfg_value),
+                rows=rows[torch.tensor(group, dtype=torch.long)],
+                noise=self._batch_noise(group_data),
+            )
+            for slot, index in enumerate(group):
+                patches[index] = group_patches[slot : slot + 1]
+                embeddings[index] = group_embeddings[slot]
         stop_flags = self.model.stop_flags(rows)
 
         for index, data in enumerate(rows_data):
-            patch = patches[index : index + 1]
+            patch = patches[index]
             data.cond = patch
+            data.next_embed = embeddings[index]
             data.latent_patches.append(patch.squeeze(0).detach().cpu())
-            if is_prefill:
-                continue
             state = data.state
             steps = len(data.latent_patches)
-            if steps > state.min_len and bool(stop_flags[index]):
+            # note (Xinhao Tan): upstream compares a zero-based patch index;
+            # comparing the patch count would allow stopping one patch early.
+            if steps - 1 > state.min_len and bool(stop_flags[index]):
                 data.finish_reason = "stop"
             elif steps >= state.max_len:
                 data.finish_reason = "length"
-            if data.finish_reason is not None:
+            # note (Xinhao Tan): prefill skips already-finished requests before
+            # releasing their KV slots. Its token limit must finish the first
+            # patch through the upstream result processor instead.
+            if data.finish_reason is not None and not is_prefill:
                 data.req.finished_reason = FINISH_MATCHED_TOKEN(0)
 
-        if self.model.graph_feedback_buffer is not None:
-            self.model.write_feedback(embeddings)
+    def _batch_noise(
+        self, rows_data: list[VoxCPM2SGLangRequestData]
+    ) -> torch.Tensor | None:
+        """Draw this step's flow-matching noise per request, when a seed asks.
+
+        None hands the draw back to the sampler, which is what an unseeded
+        request wants: one fused draw for the batch, exactly as upstream. Only
+        a seeded request pays for the per-row draw its generator requires.
+        """
+        if all(data.noise_generator is None for data in rows_data):
+            return None
+        parameter = next(self.model.parameters())
+        shape = (1, self.model.feat_dim, self.model.patch_size)
+        rows = [
+            torch.randn(shape, generator=data.noise_generator) for data in rows_data
+        ]
+        return torch.cat(rows, dim=0).to(device=parameter.device, dtype=parameter.dtype)
 
     def _batch_cond(self, rows_data: list[VoxCPM2SGLangRequestData]) -> torch.Tensor:
         """Stack each request's previous patch into the DiT's condition batch."""
@@ -101,35 +199,30 @@ class VoxCPM2ModelRunner(ModelRunner):
         )
         return torch.cat(
             [
-                zeros if data.cond is None else data.cond.to(parameter.device)
+                (
+                    zeros
+                    if data.cond is None
+                    else data.cond.to(device=parameter.device, dtype=parameter.dtype)
+                )
                 for data in rows_data
             ],
             dim=0,
         )
 
 
-def _shared_sampling(rows_data: list[VoxCPM2SGLangRequestData]) -> tuple[int, float]:
-    """One batch runs one sampling recipe; reject a batch that mixes them.
+def _recipe_groups(rows_data: list[VoxCPM2SGLangRequestData]) -> list[list[int]]:
+    """Split a batch into the runs of requests that share one sampling recipe.
 
-    The DiT samples the whole batch in lockstep, so a differing step count or
-    guidance scale cannot be honored per row. Refusing is the only option that
-    does not silently synthesize some requests with another request's recipe.
+    The DiT samples its batch in lockstep, so one call cannot honor a differing
+    step count or guidance scale. Grouping lets requests that differ still
+    share the AR forward and split only the diffusion step; refusing the batch
+    instead would let one caller's parameters fail everyone beside them.
     """
-    first = rows_data[0].state
-    timesteps = int(first.inference_timesteps)
-    cfg_value = float(first.cfg_value)
-    for data in rows_data[1:]:
-        if int(data.state.inference_timesteps) != timesteps:
-            raise ValueError(
-                "VoxCPM2 cannot batch requests with different inference_timesteps: "
-                f"{timesteps} and {data.state.inference_timesteps}"
-            )
-        if float(data.state.cfg_value) != cfg_value:
-            raise ValueError(
-                "VoxCPM2 cannot batch requests with different cfg_value: "
-                f"{cfg_value} and {data.state.cfg_value}"
-            )
-    return timesteps, cfg_value
+    groups: dict[tuple[int, float], list[int]] = {}
+    for index, data in enumerate(rows_data):
+        key = (int(data.state.inference_timesteps), float(data.state.cfg_value))
+        groups.setdefault(key, []).append(index)
+    return list(groups.values())
 
 
 __all__ = ["VoxCPM2ModelRunner"]

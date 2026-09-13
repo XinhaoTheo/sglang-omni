@@ -335,6 +335,8 @@ class SGLModelRunner(ModelRunner):
             )
         kwargs["input_embeds"] = prefill_inputs.input_embeds
         kwargs["omni_prefill_rids"] = forward_batch.rids
+        if prefill_inputs.audio_mask is not None:
+            kwargs["audio_mask"] = prefill_inputs.audio_mask
         if prefill_inputs.input_embeds_are_projected is not None:
             kwargs["input_embeds_are_projected"] = (
                 prefill_inputs.input_embeds_are_projected

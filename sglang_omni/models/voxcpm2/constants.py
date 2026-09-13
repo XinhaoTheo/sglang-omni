@@ -21,5 +21,3 @@ AUDIO_PROMPT_START_TOKEN = "<|audio_prompt_start|>"
 AUDIO_PROMPT_END_TOKEN = "<|audio_prompt_end|>"
 
 CONFIG_FILE = "config.json"
-WEIGHT_FILE_CANDIDATES = ("model.safetensors", "pytorch_model.bin")
-AUDIO_VAE_FILE_CANDIDATES = ("audiovae.pth",)

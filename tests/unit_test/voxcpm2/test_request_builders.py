@@ -11,8 +11,12 @@ from sglang_omni.models.voxcpm2.hf_config import VoxCPM2RuntimeConfig
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.models.voxcpm2.request_builders import (
     VoxCPM2PreprocessingContext,
+    VoxCPM2SGLangRequestData,
+    apply_voxcpm2_result,
     audio_prefix_fingerprint,
     build_prefill_inputs,
+    build_sglang_voxcpm2_request,
+    build_stream_output,
     build_voxcpm2_state,
 )
 
@@ -185,3 +189,87 @@ def test_identical_reference_audio_gets_the_same_radix_key():
 def test_zero_shot_requests_share_one_radix_subtree():
     state = VoxCPM2State(text_token=torch.tensor([1, 2], dtype=torch.int32))
     assert audio_prefix_fingerprint(_prefill(state)) is None
+
+
+def _streaming_data(stream=True):
+    return VoxCPM2SGLangRequestData(
+        state=VoxCPM2State(stream=stream),
+        stream_metadata={"modality": "audio_latents", "stream": stream},
+    )
+
+
+def test_a_non_streaming_request_sends_no_chunks():
+    data = _streaming_data(stream=False)
+    data.latent_patches.append(torch.zeros(4, 64))
+    assert list(build_stream_output("r", data, None)) == []
+
+
+def test_each_patch_is_sent_once_and_only_once():
+    """A step that sampled nothing must not re-send the patch before it."""
+    data = _streaming_data()
+    data.latent_patches.append(torch.zeros(4, 64))
+    assert len(list(build_stream_output("r", data, None))) == 1
+    assert list(build_stream_output("r", data, None)) == []
+
+    data.latent_patches.append(torch.ones(4, 64))
+    second = list(build_stream_output("r", data, None))
+    assert len(second) == 1
+    assert second[0].metadata["chunk_id"] == 1
+
+
+def test_a_chunk_carries_the_bare_patch_tensor():
+    """The cross-process stage relay rejects anything that is not a tensor."""
+    data = _streaming_data()
+    data.latent_patches.append(torch.zeros(4, 64))
+    message = next(iter(build_stream_output("r", data, None)))
+    assert isinstance(message.data, torch.Tensor)
+    assert message.metadata["modality"] == "audio_latents"
+    assert message.metadata["stream"] is True
+
+
+@pytest.mark.parametrize("continuation", [False, True])
+def test_first_diffusion_condition_is_the_final_prefill_patch(continuation):
+    state = VoxCPM2State(text_token=torch.tensor([1, 2], dtype=torch.int32))
+    if continuation:
+        state.prompt_latents = torch.arange(3 * 4 * 64).reshape(3, 4, 64).float()
+    payload = _FakePayload(_FakeRequest("hi"))
+    payload.data = state.to_dict()
+    data = build_sglang_voxcpm2_request(
+        payload, tokenizer=_FakeTokenizer(), patch_size=4, feat_dim=64, vocab_size=256
+    )
+    expected = state.prompt_latents[-1:] if continuation else torch.zeros(1, 4, 64)
+    torch.testing.assert_close(data.cond, expected, rtol=0, atol=0)
+    assert data.state.context_len == (3 if continuation else 0)
+
+
+def test_context_is_sent_once_and_excluded_from_completion_usage():
+    state = VoxCPM2State(
+        text_token=torch.tensor([1, 2], dtype=torch.int32),
+        stream=True,
+        prompt_latents=torch.arange(5 * 4 * 64).reshape(5, 4, 64).float(),
+    )
+    payload = _FakePayload(_FakeRequest("hi"))
+    payload.data = state.to_dict()
+    data = build_sglang_voxcpm2_request(
+        payload, tokenizer=_FakeTokenizer(), patch_size=4, feat_dim=64, vocab_size=256
+    )
+    generated = torch.full((4, 64), -1.0)
+    data.latent_patches.append(generated)
+    chunks = list(build_stream_output("req", data, None))
+    assert len(chunks) == 4
+    assert [chunk.metadata["chunk_id"] for chunk in chunks] == list(range(4))
+    assert all(chunk.metadata["context_len"] == 3 for chunk in chunks)
+    torch.testing.assert_close(
+        torch.stack([c.data for c in chunks[:3]]), state.prompt_latents[-3:]
+    )
+    assert list(build_stream_output("req", data, None)) == []
+    apply_voxcpm2_result(data)
+    assert data.state.completion_tokens == 1
+    expected = torch.cat([state.prompt_latents[-3:], generated.unsqueeze(0)])
+    torch.testing.assert_close(
+        data.state.generated_latents, expected.permute(2, 0, 1).reshape(64, -1)
+    )
+
+
+def test_zero_minimum_length_survives_state_serialization():
+    assert VoxCPM2State.from_dict(VoxCPM2State(min_len=0).to_dict()).min_len == 0

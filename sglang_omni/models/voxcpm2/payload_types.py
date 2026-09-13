@@ -31,7 +31,7 @@ class VoxCPM2State(DeclarativeStateBase):
     feat_dim: int = wire(C.FEAT_DIM, codec="int_or")
     inference_timesteps: int = wire(C.DEFAULT_INFERENCE_TIMESTEPS, codec="int_or")
     cfg_value: float = wire(C.DEFAULT_CFG_VALUE, codec="float")
-    min_len: int = wire(C.DEFAULT_MIN_LEN, codec="int_or")
+    min_len: int = wire(C.DEFAULT_MIN_LEN, codec="int")
     max_len: int = wire(C.DEFAULT_MAX_LEN, codec="int_or")
     streaming_prefix_len: int = wire(C.DEFAULT_STREAMING_PREFIX_LEN, codec="int_or")
     seed: int | None = wire(None, codec="opt_int")

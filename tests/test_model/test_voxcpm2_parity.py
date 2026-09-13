@@ -22,14 +22,10 @@ import torch
 
 pytestmark = pytest.mark.accelerator
 
-# note (Xinhao Tan): tolerances are per dtype because bf16 carries 7 explicit
-# mantissa bits, so one ULP at magnitude 16 is already 0.125 and an fp32-sized
-# tolerance reports rounding as a failed port. Seeds are fixed for the same
-# reason a tolerance is: a run has to be comparable to the previous one.
+# These hand-ported components use the same operations and weights. Earlier
+# fixed-image H100 runs measured zero error; require exact values, including BF16.
 _TOLERANCE = {
-    torch.float32: (1e-4, 1e-4),
-    torch.bfloat16: (6e-2, 6e-2),
-    torch.float16: (1e-2, 1e-2),
+    dtype: (0.0, 0.0) for dtype in (torch.float32, torch.bfloat16, torch.float16)
 }
 _SEED = 1234
 
@@ -58,8 +54,8 @@ def _ulp(reference: torch.Tensor, dtypes: str) -> float:
 def _assert_close(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
     """Compare and report the deltas, so a passing run still yields numbers.
 
-    The mismatch count separates a rounding difference from a wrong port: a
-    handful of outliers is precision, most of the tensor is a real divergence.
+    Mismatch counts and peak ULP are descriptive only; neither establishes
+    whether an error comes from precision or an incorrect port.
     """
     atol, rtol = _TOLERANCE.get(theirs.dtype, (1e-4, 1e-4))
     dtypes = f"{ours.dtype}/{theirs.dtype}"
@@ -103,7 +99,7 @@ def parity_models():
 
     checkpoint = resolve_checkpoint(checkpoint)
     config = load_voxcpm2_config(checkpoint)
-    upstream = VoxCPM2Model.from_local(checkpoint, device="cuda:0")
+    upstream = VoxCPM2Model.from_local(checkpoint, device="cuda:0", optimize=False)
     upstream.eval()
 
     ours = {
@@ -119,9 +115,12 @@ def test_audio_vae_encode_matches_upstream(parity_models):
     sample_rate = ours["config"].sample_rate
     waveform = _seeded(1, 1, sample_rate)
 
+    # note (Xinhao Tan): warm both implementations so the comparison does not
+    # mix TorchScript's initial execution with its optimized execution.
     with torch.inference_mode():
-        theirs = upstream.audio_vae.encode(waveform, sample_rate)
-        mine = ours["audio_vae"].encode(waveform, sample_rate)
+        for _ in range(3):
+            theirs = upstream.audio_vae.encode(waveform, sample_rate)
+            mine = ours["audio_vae"].encode(waveform, sample_rate)
     _assert_close(mine, theirs, "AudioVAE encode")
 
 
@@ -131,9 +130,23 @@ def test_audio_vae_decode_matches_upstream(parity_models):
     latents = _seeded(1, latent_dim, 32)
 
     with torch.inference_mode():
-        theirs = upstream.audio_vae.decode(latents)
-        mine = ours["audio_vae"].decode(latents)
+        for _ in range(3):
+            theirs = upstream.audio_vae.decode(latents)
+            mine = ours["audio_vae"].decode(latents)
     _assert_close(mine, theirs, "AudioVAE decode")
+
+
+@torch.inference_mode()
+def test_audio_vae_warmed_decode_is_exact_across_shapes(parity_models):
+    _, ours = parity_models
+    warmup = _seeded(1, ours["config"].latent_dim, 76)
+    for _ in range(3):
+        ours["audio_vae"].decode(warmup)
+    for frames in (76, 32, 76):
+        latents = _seeded(1, ours["config"].latent_dim, frames)
+        decoded = [ours["audio_vae"].decode(latents).clone() for _ in range(3)]
+        for repeated in decoded[1:]:
+            torch.testing.assert_close(decoded[0], repeated, atol=0, rtol=0)
 
 
 def test_local_encoder_matches_upstream(parity_models):

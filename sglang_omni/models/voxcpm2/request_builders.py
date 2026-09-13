@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,7 +15,9 @@ from sglang_omni.models.voxcpm2.hf_config import VoxCPM2RuntimeConfig
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.preprocessing.cache_key import hash_bytes
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import load_state, store_state
+from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
 
@@ -61,7 +64,11 @@ def build_voxcpm2_state(
     payload: StagePayload, context: VoxCPM2PreprocessingContext
 ) -> VoxCPM2State:
     """Build the VoxCPM2 state from an incoming request."""
-    inputs = _dict(payload.request.inputs)
+    raw_inputs = payload.request.inputs
+    # note (Xinhao Tan): the speech endpoint hands over a bare string when the
+    # request carries no reference audio, and a dict only when it does, so a
+    # zero-shot request arrives in a different shape from a cloning one.
+    inputs = {"text": raw_inputs} if isinstance(raw_inputs, str) else _dict(raw_inputs)
     params = _dict(payload.request.params)
     tts_params = _dict(_dict(payload.request.metadata).get("tts_params"))
     engine_params = _dict(_dict(params.get("stage_params")).get("tts_engine"))
@@ -228,16 +235,25 @@ def build_prefill_inputs(
 
 
 @dataclass
-class VoxCPM2SGLangRequestData:
-    """Per-request engine data the scheduler hangs off the sglang request."""
+class VoxCPM2SGLangRequestData(SGLangARRequestData):
+    """Per-request engine data the scheduler hangs off the sglang request.
 
-    stage_payload: StagePayload
-    state: VoxCPM2State
-    prefill: VoxCPM2PrefillInputs
-    req: Any = None
+    Inherits the AR contract rather than redeclaring it: the scheduler reads
+    fields such as enforce_request_limits off this object, and a standalone
+    dataclass satisfies the parts the model touches while failing on the parts
+    only the scheduler touches.
+    """
+
+    state: VoxCPM2State = field(default_factory=VoxCPM2State)
+    prefill: VoxCPM2PrefillInputs | None = None
     cond: Any = None
+    next_embed: Any = None
     latent_patches: list[Any] = field(default_factory=list)
+    context_patches: list[Any] = field(default_factory=list)
     finish_reason: str | None = None
+    noise_generator: Any = None
+    stream_metadata: dict[str, Any] | None = None
+    chunk_id: int = 0
     engine_start_s: float = field(default_factory=time.perf_counter)
 
 
@@ -291,16 +307,65 @@ def build_sglang_voxcpm2_request(
     req._input_embeds_are_projected = True
     req._codec_suppress_tokens = None
 
+    # note (Xinhao Tan): the seed has to own a generator of its own rather than
+    # reseed the global RNG. The flow sampler draws once per decode step, so a
+    # global reseed would make one request's audio depend on how many steps the
+    # requests sharing its batch happened to have taken. Drawing on CPU keeps
+    # the same seed reproducible across devices.
+    generator = (
+        torch.Generator(device="cpu").manual_seed(int(state.seed))
+        if state.seed is not None
+        else None
+    )
+
+    context_patches = []
+    if bool(prefill.audio_mask[-1]):
+        audio = prefill.audio_feat[prefill.audio_mask.bool()]
+        count = min(max(0, state.streaming_prefix_len - 1), len(audio))
+        if count:
+            context_patches = list(audio[-count:].unbind(0))
+    state.context_len = len(context_patches)
+
     return VoxCPM2SGLangRequestData(
-        stage_payload=payload, state=state, prefill=prefill, req=req
+        stage_payload=payload,
+        state=state,
+        prefill=prefill,
+        cond=prefill.audio_feat[-1:].clone(),
+        req=req,
+        noise_generator=generator,
+        context_patches=context_patches,
+        stream_metadata={
+            "modality": "audio_latents",
+            "stream": bool(state.stream),
+            "context_len": state.context_len,
+        },
     )
 
 
-def build_stream_output(data: VoxCPM2SGLangRequestData) -> dict[str, Any] | None:
-    """One streamed chunk: the patch sampled by the step that just finished."""
-    if not data.latent_patches:
-        return None
-    return {"patch": data.latent_patches[-1]}
+def build_stream_output(
+    request_id: str, data: VoxCPM2SGLangRequestData, req_output: Any
+) -> Iterator[OutgoingMessage]:
+    """Emit the patch the step that just finished sampled, one chunk at a time."""
+    del req_output
+    if not data.state.stream:
+        return
+    # note (Xinhao Tan): the patch rides as a bare tensor, not wrapped in a
+    # dict. Between two processes the stage relay carries a stream chunk as a
+    # tensor and rejects anything else, so a wrapper works only while the
+    # engine and the vocoder happen to share a process.
+    #
+    # chunk_id doubles as the count already sent, so a step that sampled no
+    # patch sends nothing instead of repeating the one before it.
+    base = dict(data.stream_metadata or {})
+    patches = data.context_patches + data.latent_patches
+    while data.chunk_id < len(patches):
+        yield OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=patches[data.chunk_id],
+            metadata={**base, "chunk_id": data.chunk_id},
+        )
+        data.chunk_id += 1
 
 
 def apply_voxcpm2_result(data: VoxCPM2SGLangRequestData) -> StagePayload:
@@ -308,7 +373,7 @@ def apply_voxcpm2_result(data: VoxCPM2SGLangRequestData) -> StagePayload:
     if not data.latent_patches:
         raise RuntimeError("VoxCPM2 generated no latent patches")
     state = data.state
-    patches = torch.stack(data.latent_patches, dim=0)
+    patches = torch.stack(data.context_patches + data.latent_patches, dim=0)
     state.generated_latents = patches.permute(2, 0, 1).reshape(patches.shape[2], -1)
     state.completion_tokens = len(data.latent_patches)
     state.prompt_tokens = int(data.prefill.text_token.numel())

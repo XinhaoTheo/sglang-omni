@@ -3,7 +3,12 @@
 
 from typing import ClassVar
 
-from sglang_omni.config import FactoryArgs, PipelineConfig, StageConfig
+from sglang_omni.config import (
+    EngineStageConfig,
+    FactoryArgs,
+    PipelineConfig,
+    StageConfig,
+)
 from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.platforms import current_platform
 
@@ -17,6 +22,11 @@ VOCODER_STAGE = "vocoder"
 class VoxCPM2PipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = C.ARCHITECTURE
     required_speech_reference_count: ClassVar[int | None] = None
+    # The engine block in examples/configs/voxcpm2.yaml only reaches a
+    # stage whose config class declares one.
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        ENGINE_STAGE: EngineStageConfig,
+    }
 
     stages: list[StageConfig] = [
         StageConfig(
@@ -39,7 +49,7 @@ class VoxCPM2PipelineConfig(PipelineConfig):
             gpu=0,
             next=ENGINE_STAGE,
         ),
-        StageConfig(
+        EngineStageConfig(
             name=ENGINE_STAGE,
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_tts_engine_executor",

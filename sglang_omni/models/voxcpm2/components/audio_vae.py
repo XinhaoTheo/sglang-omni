@@ -44,8 +44,6 @@ def WNCausalTransposeConv1d(*args: Any, **kwargs: Any) -> nn.Module:
     return weight_norm(CausalTransposeConv1d(*args, **kwargs))
 
 
-# note (Xinhao Tan): do not drop @torch.jit.script without measuring first -
-# upstream reports it makes the VAE 1.4x faster.
 @torch.jit.script
 def snake(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     shape = x.shape

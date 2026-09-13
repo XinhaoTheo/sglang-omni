@@ -62,6 +62,14 @@ class MiniCPMRMSNorm(nn.Module):
         return rms_layernorm(hidden_states, self.weight, self.variance_epsilon)
 
 
+class MiniCPMSiluAndMul(nn.Module):
+    """Preserve the checkpoint's BF16 rounding between SiLU and multiply."""
+
+    def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+        gate, up = gate_up.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)

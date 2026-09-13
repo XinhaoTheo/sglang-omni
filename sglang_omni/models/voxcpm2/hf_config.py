@@ -113,9 +113,18 @@ class VoxCPM2Config(PretrainedConfig):
         # SGLang the base stack's depth instead and leaves the pool too small
         # for the residual stack's layer ids.
         if isinstance(lm_config, dict):
-            lm_config = PretrainedConfig(**lm_config)
+            # note (Xinhao Tan): hidden_act is absent from the checkpoint, but
+            # SGLang's MiniCPMMLP reads it off the config. Upstream hardcodes
+            # nn.SiLU in its own MLP, so silu is what the weights were trained
+            # with; this is filling in a field, not choosing an activation.
+            lm_config = PretrainedConfig(**{"hidden_act": "silu", **lm_config})
         self.lm_config = lm_config
         self.voxcpm2_config = dict(voxcpm2_config or {})
+
+        # The checkpoint names its architecture in the singular "architecture"
+        # key, so PretrainedConfig leaves architectures empty and SGLang's
+        # ModelConfig indexes into None while resolving the model class.
+        kwargs.setdefault("architectures", [VOXCPM2_MODEL_ARCH_OVERRIDE])
 
         if lm_config is not None:
             base_layers = int(getattr(lm_config, "num_hidden_layers", 0))
@@ -167,4 +176,40 @@ __all__ = [
     "VoxCPM2RuntimeConfig",
     "load_voxcpm2_config",
     "register_voxcpm2_hf_config",
+    "stage_checkpoint_for_autoconfig",
 ]
+
+
+def stage_checkpoint_for_autoconfig(checkpoint: str) -> str:
+    """Expose the checkpoint through a directory whose config carries model_type.
+
+    note (Xinhao Tan): VoxCPM2's config.json has no ``model_type``, and
+    transformers' AutoConfig keys its registry on exactly that field, so the
+    engine cannot load the checkpoint directory as published. Editing the
+    snapshot in place would corrupt a cache entry every other tool shares, so
+    this stages a sibling directory that symlinks the weights and carries a
+    config of its own.
+    """
+    root = Path(checkpoint)
+    raw = json.loads((root / C.CONFIG_FILE).read_text(encoding="utf-8"))
+    if raw.get("model_type") == VOXCPM2_MODEL_TYPE:
+        return checkpoint
+
+    staged = root.parent / f"{root.name}-sglang-omni"
+    staged.mkdir(parents=True, exist_ok=True)
+    for entry in root.iterdir():
+        if entry.name == C.CONFIG_FILE:
+            continue
+        link = staged / entry.name
+        # note (Xinhao Tan): exists() is false for dangling symlinks. Another
+        # builder can also create the link between this check and symlink_to().
+        if link.is_symlink() or link.exists():
+            continue
+        try:
+            link.symlink_to(entry)
+        except FileExistsError:
+            pass
+
+    raw["model_type"] = VOXCPM2_MODEL_TYPE
+    (staged / C.CONFIG_FILE).write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    return str(staged)

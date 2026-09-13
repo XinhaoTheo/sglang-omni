@@ -49,14 +49,18 @@ class UnifiedCFM(torch.nn.Module):
         cfg_value: float = 1.0,
         sway_sampling_coef: float = 1.0,
         use_cfg_zero_star: bool = True,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch = mu.shape[0]
-        x = (
-            torch.randn(
+        # note (Xinhao Tan): the noise parameter is the one departure from
+        # upstream here, and it exists so a request's seed can own its draw.
+        # Left unset it draws exactly as upstream does, which is what keeps an
+        # unseeded request comparable against the reference implementation.
+        if noise is None:
+            noise = torch.randn(
                 (batch, self.in_channels, patch_size), device=mu.device, dtype=mu.dtype
             )
-            * temperature
-        )
+        x = noise.to(device=mu.device, dtype=mu.dtype) * temperature
 
         t_span = torch.linspace(1, 0, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         t_span = t_span + sway_sampling_coef * (
