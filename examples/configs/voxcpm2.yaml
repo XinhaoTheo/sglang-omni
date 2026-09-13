@@ -15,9 +15,8 @@ stages:
       max_running_requests: 1
   vocoder:
     factory:
-      # Chunk cadence for streaming: the first chunk waits for stream_stride
-      # patches, later chunks for stream_followup_stride more. One patch is
-      # 160 ms of audio. These two are unmeasured starting points.
-      stream_stride: 8
+      # note (Xinhao Tan): four initial patches reduced first-audio latency
+      # without increasing RTF in the single-client H100 SeedTTS comparison.
+      stream_stride: 4
       stream_followup_stride: 4
       max_batch_size: 1

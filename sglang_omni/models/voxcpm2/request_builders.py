@@ -138,6 +138,7 @@ def build_voxcpm2_state(
                 engine_params.get("max_len"),
                 tts_params.get("max_len"),
                 params.get("max_len"),
+                params.get("max_new_tokens"),
                 default=C.DEFAULT_MAX_LEN,
             )
         ),
@@ -279,6 +280,8 @@ def build_sglang_voxcpm2_request(
     patch_size: int,
     feat_dim: int,
     vocab_size: int,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
 ) -> VoxCPM2SGLangRequestData:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -323,8 +326,18 @@ def build_sglang_voxcpm2_request(
         audio = prefill.audio_feat[prefill.audio_mask.bool()]
         count = min(max(0, state.streaming_prefix_len - 1), len(audio))
         if count:
-            context_patches = list(audio[-count:].unbind(0))
+            context_patches = list(audio[-count:].detach().unbind(0))
     state.context_len = len(context_patches)
+
+    # note (Xinhao Tan): the stage payload and vocoder context use CPU wire
+    # tensors. Normalize the AR inputs at admission, after hashing the original
+    # FP32 reference so dtype rounding cannot merge distinct cache keys.
+    prefill = VoxCPM2PrefillInputs(
+        text_token=prefill.text_token.detach().to(device=device),
+        audio_feat=prefill.audio_feat.detach().to(device=device, dtype=dtype),
+        text_mask=prefill.text_mask.detach().to(device=device),
+        audio_mask=prefill.audio_mask.detach().to(device=device),
+    )
 
     return VoxCPM2SGLangRequestData(
         stage_payload=payload,

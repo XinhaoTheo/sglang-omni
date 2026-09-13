@@ -111,12 +111,15 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
         )
 
         def _build_request(payload: Any) -> Any:
+            parameter = next(model.parameters())
             return build_sglang_voxcpm2_request(
                 payload,
                 tokenizer=self._tokenizer,
                 patch_size=model.patch_size,
                 feat_dim=model.feat_dim,
                 vocab_size=int(model.config.vocab_size),
+                device=parameter.device,
+                dtype=parameter.dtype,
             )
 
         return _build_request, apply_voxcpm2_result

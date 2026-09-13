@@ -69,6 +69,136 @@ def _state_for(references):
     return build_voxcpm2_state(payload, _context())
 
 
+def _speech_state(**kwargs):
+    from sglang_omni.client.client import Client
+    from sglang_omni.serve.protocol import CreateSpeechRequest
+    from sglang_omni.serve.speech_service import SpeechRequestValidator
+
+    request = CreateSpeechRequest(input="hi", **kwargs)
+    generated = SpeechRequestValidator(default_model="voxcpm2").build_generate_request(
+        request
+    )
+    return build_voxcpm2_state(
+        _FakePayload(Client._build_omni_request(generated)), _context()
+    )
+
+
+def test_speech_endpoint_defaults_preserve_voxcpm2_sampling():
+    state = _speech_state()
+    assert state.inference_timesteps == C.DEFAULT_INFERENCE_TIMESTEPS
+    assert state.cfg_value == C.DEFAULT_CFG_VALUE
+    assert state.max_len == C.DEFAULT_MAX_LEN
+
+
+def test_speech_endpoint_explicit_length_and_stage_recipe_reach_builder():
+    state = _speech_state(
+        max_new_tokens=1,
+        seed=17,
+        stage_params={"tts_engine": {"inference_timesteps": 4, "cfg_value": 1.5}},
+    )
+    assert (state.max_len, state.seed) == (1, 17)
+    assert (state.inference_timesteps, state.cfg_value) == (4, 1.5)
+
+
+def test_model_length_override_takes_precedence_over_generic_length():
+    state = _speech_state(max_new_tokens=1, stage_params={"tts_engine": {"max_len": 3}})
+    assert state.max_len == 3
+
+
+@pytest.mark.parametrize("abort_before_compute", [True, False])
+def test_preprocessing_abort_never_hands_off_a_cancelled_payload(abort_before_compute):
+    import threading
+
+    from sglang_omni.scheduling.messages import IncomingMessage
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    executed = []
+
+    def compute(payload):
+        executed.append(payload.request_id)
+        if payload.request_id == "cancelled":
+            entered.set()
+            assert release.wait(timeout=5)
+        payload.data = build_voxcpm2_state(payload, _context()).to_dict()
+        if payload.request_id == "cancelled":
+            completed.set()
+        return payload
+
+    scheduler = SimpleScheduler(compute, max_concurrency=8)
+    thread = threading.Thread(target=scheduler.start, daemon=True)
+    thread.start()
+
+    def enqueue(request_id):
+        payload = _FakePayload(_FakeRequest("hi"))
+        payload.request_id = request_id
+        scheduler.inbox.put(
+            IncomingMessage(request_id=request_id, type="new_request", data=payload)
+        )
+
+    try:
+        if abort_before_compute:
+            scheduler.abort("cancelled")
+        enqueue("cancelled")
+        if not abort_before_compute:
+            assert entered.wait(timeout=5)
+            scheduler.abort("cancelled")
+            release.set()
+            assert completed.wait(timeout=5)
+        enqueue("live")
+        result = scheduler.outbox.get(timeout=5)
+        assert (result.request_id, result.type) == ("live", "result")
+    finally:
+        release.set()
+        scheduler.stop()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert scheduler.outbox.empty()
+    assert ("cancelled" in executed) is not abort_before_compute
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_ar_admission_normalizes_compute_tensors_and_preserves_wire_context(device):
+    state = VoxCPM2State(
+        text_token=torch.tensor([1, 2], dtype=torch.int32),
+        prompt_latents=torch.full((3, 4, 64), 1.001, requires_grad=True),
+    )
+    payload = _FakePayload(_FakeRequest("hi"))
+    payload.data = state.to_dict()
+    original_key = audio_prefix_fingerprint(_prefill(state))
+    data = build_sglang_voxcpm2_request(
+        payload,
+        tokenizer=_FakeTokenizer(),
+        patch_size=4,
+        feat_dim=64,
+        vocab_size=256,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    for tensor in (
+        data.prefill.text_token,
+        data.prefill.text_mask,
+        data.prefill.audio_mask,
+        data.prefill.audio_feat,
+        data.cond,
+    ):
+        assert tensor.device.type == device
+        assert not tensor.requires_grad
+    assert data.prefill.audio_feat.dtype == data.cond.dtype == torch.bfloat16
+    assert data.req.extra_key == original_key
+    assert data.req.origin_input_ids == [1, 2, 0, 0, 0]
+    assert len(data.context_patches) == 3
+    for patch in data.context_patches:
+        assert patch.device.type == "cpu"
+        assert patch.dtype == torch.float32
+        assert not patch.requires_grad
+    if device == "cpu":
+        assert data.cond.unique().item() == 1.0
+        torch.testing.assert_close(data.context_patches[-1], state.prompt_latents[-1])
+
+
 def test_reference_without_transcript_is_a_timbre_prefix():
     state = _state_for([{"audio_path": "ref.wav"}])
     assert state.reference_audio == "ref.wav"

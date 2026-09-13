@@ -151,6 +151,8 @@ _VOXCPM2_BENCHMARK_PROFILE = _ModelBenchmarkProfile(
         "concurrency": 1,
         "warmup": 1,
         "seed": 1234,
+        "max_running_requests": 1,
+        "cuda_graph_max_bs": 1,
     },
 )
 _MODEL_BENCHMARK_PROFILES: dict[str, _ModelBenchmarkProfile] = {
