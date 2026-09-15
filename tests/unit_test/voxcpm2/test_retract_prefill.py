@@ -112,7 +112,7 @@ def test_fresh_and_retracted_requests_keep_packed_masks_and_final_rows():
     inputs = get_omni_prefill_inputs(batch)
     assert inputs.audio_mask.tolist() == [0, 1, 0, 1, 1, 0, 1, 0]
     assert inputs.input_embeds[:, 0].tolist() == [3, 4, 5, 10, 11, 3, 4, 5]
-    assert runner._prefill_rows([retracted, fresh]).tolist() == [4, 7]
+    assert runner.prefill_rows([retracted, fresh]).tolist() == [4, 7]
 
 
 def test_generated_feedback_is_saved_without_aliasing_sampler_outputs():
@@ -122,11 +122,11 @@ def test_generated_feedback_is_saved_without_aliasing_sampler_outputs():
     data.state.min_len = 20
     embeddings = torch.tensor([[11.0, 12.0]], requires_grad=True)
     runner = _runner()
-    runner._batch_cond = lambda _: torch.zeros(1, 4, 8)
-    runner._batch_noise = lambda _: None
+    runner.batch_cond = lambda _: torch.zeros(1, 4, 8)
+    runner.batch_noise = lambda _: None
     runner.model.decode_patch = lambda *a, **kw: (torch.ones(1, 4, 8), embeddings)
     runner.model.stop_flags = lambda rows: [False]
-    runner._advance([request], rows=torch.tensor([2]), is_prefill=True)
+    runner.advance([request], rows=torch.tensor([2]), is_prefill=True)
     assert len(data.decode_input_embeds) == 1
     assert not data.decode_input_embeds[0].requires_grad
     with torch.no_grad():

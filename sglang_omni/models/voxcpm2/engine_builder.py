@@ -36,8 +36,8 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
         if self.max_running_requests <= 0:
             raise ValueError("VoxCPM2 max_running_requests must be positive")
         self.model_arch_override = VOXCPM2_MODEL_ARCH_OVERRIDE
-        self._model_runner: Any | None = None
-        self._tokenizer: Any | None = None
+        self.model_runner: Any | None = None
+        self.tokenizer: Any | None = None
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         from transformers import AutoTokenizer
@@ -45,7 +45,7 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
         from sglang_omni.models.voxcpm2.hf_config import register_voxcpm2_hf_config
 
         register_voxcpm2_hf_config()
-        self._tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = AutoTokenizer.from_pretrained(
             checkpoint_dir, trust_remote_code=True
         )
 
@@ -89,7 +89,6 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
         gpu_id: int,
         server_args: Any,
     ) -> None:
-        del checkpoint_dir, device, gpu_id
         if not getattr(server_args, "disable_cuda_graph", False):
             capacity = max(
                 self.max_running_requests,
@@ -101,8 +100,8 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang_omni.models.voxcpm2.model_runner import VoxCPM2ModelRunner
 
-        self._model_runner = VoxCPM2ModelRunner(model_worker, output_proc)
-        return self._model_runner
+        self.model_runner = VoxCPM2ModelRunner(model_worker, output_proc)
+        return self.model_runner
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
         from sglang_omni.models.voxcpm2.request_builders import (
@@ -110,11 +109,11 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
             build_sglang_voxcpm2_request,
         )
 
-        def _build_request(payload: Any) -> Any:
+        def build_request(payload: Any) -> Any:
             parameter = next(model.parameters())
             return build_sglang_voxcpm2_request(
                 payload,
-                tokenizer=self._tokenizer,
+                tokenizer=self.tokenizer,
                 patch_size=model.patch_size,
                 feat_dim=model.feat_dim,
                 vocab_size=int(model.config.vocab_size),
@@ -122,7 +121,7 @@ class VoxCPM2EngineBuilder(TtsEngineBuilder):
                 dtype=parameter.dtype,
             )
 
-        return _build_request, apply_voxcpm2_result
+        return build_request, apply_voxcpm2_result
 
     def make_abort_callback(self) -> Any | None:
         # note (Xinhao Tan): returning None is deliberate, not an omission.

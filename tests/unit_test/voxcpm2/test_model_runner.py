@@ -11,7 +11,7 @@ from torch import nn
 
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.voxcpm2.components.projections import VoxCPM2Projections
-from sglang_omni.models.voxcpm2.model_runner import VoxCPM2ModelRunner, _recipe_groups
+from sglang_omni.models.voxcpm2.model_runner import VoxCPM2ModelRunner, recipe_groups
 from sglang_omni.models.voxcpm2.payload_types import VoxCPM2State
 from sglang_omni.models.voxcpm2.sglang_model import VoxCPM2SGLangModel
 
@@ -58,17 +58,17 @@ def _generation_request(*, patches=0, min_len=2, max_len=8):
 def test_stop_uses_upstreams_zero_based_generated_patch_index():
     req = _generation_request(patches=2, min_len=2)
     instance = _generation_runner()
-    instance._advance([req], rows=None, is_prefill=False)
+    instance.advance([req], rows=None, is_prefill=False)
     assert len(req.data.latent_patches) == 3
     assert req.data.finish_reason is None
-    instance._advance([req], rows=None, is_prefill=False)
+    instance.advance([req], rows=None, is_prefill=False)
     assert len(req.data.latent_patches) == 4
     assert req.data.finish_reason == "stop"
 
 
 def test_one_patch_limit_is_enforced_on_prefill():
     req = _generation_request(max_len=1)
-    _generation_runner()._advance([req], rows=torch.tensor([0]), is_prefill=True)
+    _generation_runner().advance([req], rows=torch.tensor([0]), is_prefill=True)
     assert len(req.data.latent_patches) == 1
     assert req.data.finish_reason == "length"
     assert req.data.req.finished_reason is None
@@ -77,7 +77,7 @@ def test_one_patch_limit_is_enforced_on_prefill():
 def test_continuation_condition_is_cast_to_the_model_dtype():
     req = _generation_request()
     req.data.cond = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8)
-    condition = _generation_runner()._batch_cond([req.data, _generation_request().data])
+    condition = _generation_runner().batch_cond([req.data, _generation_request().data])
     assert condition.dtype == torch.bfloat16
     torch.testing.assert_close(condition[0].float(), req.data.cond[0])
     assert torch.count_nonzero(condition[1]) == 0
@@ -205,7 +205,7 @@ def _noise_runner():
 def _draw_noise(seeds, steps=1):
     runner = _noise_runner()
     rows = [_NoiseData(seed) for seed in seeds]
-    return [runner._batch_noise(rows) for _ in range(steps)]
+    return [runner.batch_noise(rows) for _ in range(steps)]
 
 
 def test_unseeded_batch_leaves_the_draw_to_the_sampler():
@@ -245,24 +245,24 @@ class _RecipeData:
 
 
 def test_one_recipe_stays_one_group():
-    groups = _recipe_groups([_RecipeData(), _RecipeData(), _RecipeData()])
+    groups = recipe_groups([_RecipeData(), _RecipeData(), _RecipeData()])
     assert groups == [[0, 1, 2]]
 
 
 def test_a_differing_step_count_splits_the_batch():
-    groups = _recipe_groups([_RecipeData(10), _RecipeData(12), _RecipeData(10)])
+    groups = recipe_groups([_RecipeData(10), _RecipeData(12), _RecipeData(10)])
     assert groups == [[0, 2], [1]]
 
 
 def test_a_differing_guidance_scale_splits_the_batch():
-    groups = _recipe_groups([_RecipeData(cfg=2.0), _RecipeData(cfg=1.5)])
+    groups = recipe_groups([_RecipeData(cfg=2.0), _RecipeData(cfg=1.5)])
     assert groups == [[0], [1]]
 
 
 def test_every_request_lands_in_exactly_one_group():
     """A dropped index would silently leave a request without a patch."""
     rows = [_RecipeData(10), _RecipeData(12), _RecipeData(10), _RecipeData(8)]
-    indices = sorted(index for group in _recipe_groups(rows) for index in group)
+    indices = sorted(index for group in recipe_groups(rows) for index in group)
     assert indices == list(range(len(rows)))
 
 
@@ -273,13 +273,13 @@ def test_decode_consumes_both_replay_outputs_after_prefill_and_batch_changes():
     instance = object.__new__(VoxCPM2ModelRunner)
     instance.model = model
     observed = []
-    instance._advance = lambda requests, rows, is_prefill: observed.append(
-        model._rows(None)
+    instance.advance = lambda requests, rows, is_prefill: observed.append(
+        model.rows(None)
     )
     for step, size in enumerate((2, 1, 2)):
         # A previous prefill overwrites Python attributes, but replay does not.
-        model._last_lm_hidden = torch.full((8, 2), -1.0)
-        model._last_residual_hidden = torch.full((8, 2), -2.0)
+        model.last_lm_hidden = torch.full((8, 2), -1.0)
+        model.last_residual_hidden = torch.full((8, 2), -2.0)
         hidden = torch.arange(size * 4).reshape(size, 4).float() + step * 100
         result = SimpleNamespace(logits_output=SimpleNamespace(hidden_states=hidden))
         instance.post_decode(result, None, None, [object()] * size)
@@ -305,7 +305,7 @@ def _mask_projections():
 
 def _forward_with_mask(hidden, embed, audio_mask=None):
     model = SimpleNamespace(
-        _graph_feedback_buffer=None,
+        graph_feedback_buffer=None,
         projections=_mask_projections(),
         forward_base=lambda *args: hidden,
         forward_residual=lambda inputs, *args: inputs,
@@ -324,7 +324,7 @@ def _forward_with_mask(hidden, embed, audio_mask=None):
         input_embeds=embed,
         audio_mask=audio_mask,
     )
-    return model._last_lm_hidden, model._last_residual_hidden
+    return model.last_lm_hidden, model.last_residual_hidden
 
 
 def test_text_prefill_is_not_quantized_and_does_not_condition_residual_audio():
@@ -354,3 +354,16 @@ def test_decode_quantizes_every_row_and_keeps_the_previous_patch_embedding():
     actual, fused = _forward_with_mask(hidden, embed)
     torch.testing.assert_close(actual, 2 * hidden, rtol=0, atol=0)
     torch.testing.assert_close(fused[:, 2:], embed, rtol=0, atol=0)
+
+
+def test_graph_feedback_keeps_buffer_address_when_inputs_change():
+    model = VoxCPM2SGLangModel.__new__(VoxCPM2SGLangModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(lm_config=SimpleNamespace(hidden_size=3))
+    model.register_parameter("weight", nn.Parameter(torch.zeros(1)))
+    model.enable_graph_feedback(2)
+    buffer = model.graph_feedback_buffer
+    feedback = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    model.write_feedback(feedback)
+    assert model.graph_feedback_buffer is buffer
+    torch.testing.assert_close(buffer, feedback)

@@ -103,11 +103,11 @@ class MiniCPMLongRoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("cos_cached", torch.empty(0), persistent=False)
         self.register_buffer("sin_cached", torch.empty(0), persistent=False)
-        self._set_cos_sin_cache(
+        self.set_cos_sin_cache(
             config.max_position_embeddings, original, self.inv_freq.device
         )
 
-    def _set_cos_sin_cache(
+    def set_cos_sin_cache(
         self, seq_len: int, original: int, device: torch.device
     ) -> None:
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)

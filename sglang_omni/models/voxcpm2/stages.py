@@ -27,15 +27,15 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 logger = logging.getLogger(__name__)
 
-_AUDIO_VAE_FILES = ("audiovae.safetensors", "audiovae.pth")
+AUDIO_VAE_FILES = ("audiovae.safetensors", "audiovae.pth")
 
 
-def _load_audio_vae(
+def load_audio_vae(
     checkpoint: str, config: VoxCPM2RuntimeConfig, *, device: str
 ) -> AudioVAE:
     """Build the AudioVAE and load its standalone checkpoint file."""
     root = Path(checkpoint)
-    for name in _AUDIO_VAE_FILES:
+    for name in AUDIO_VAE_FILES:
         path = root / name
         if not path.is_file():
             continue
@@ -56,12 +56,12 @@ def _load_audio_vae(
 
     raise FileNotFoundError(
         f"VoxCPM2 AudioVAE checkpoint not found under {root}; "
-        f"expected one of {list(_AUDIO_VAE_FILES)}"
+        f"expected one of {list(AUDIO_VAE_FILES)}"
     )
 
 
 @lru_cache(maxsize=2)
-def _resolved(model_path: str) -> tuple[str, VoxCPM2RuntimeConfig]:
+def resolve_model_config(model_path: str) -> tuple[str, VoxCPM2RuntimeConfig]:
     checkpoint = resolve_checkpoint(model_path)
     return checkpoint, load_voxcpm2_config(checkpoint)
 
@@ -71,7 +71,7 @@ def create_preprocessing_executor(
     *,
     max_concurrency: int = 8,
 ) -> SimpleScheduler:
-    checkpoint, config = _resolved(model_path)
+    checkpoint, config = resolve_model_config(model_path)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
     set_voxcpm2_preprocessing_context(
         VoxCPM2PreprocessingContext(config=config, tokenizer=tokenizer)
@@ -84,16 +84,12 @@ def create_reference_encode_executor(
     *,
     device: str = "cuda",
     gpu_id: int | None = None,
-    dtype: str = "bfloat16",
     max_concurrency: int = 8,
-    max_batch_size: int = 8,
-    max_batch_wait_ms: int = 10,
 ) -> SimpleScheduler:
-    del dtype, max_batch_size, max_batch_wait_ms  # the VAE encoder runs per request
-    checkpoint, config = _resolved(model_path)
+    checkpoint, config = resolve_model_config(model_path)
     worker_device = device if gpu_id is None else f"{device}:{gpu_id}"
     encoder = VoxCPM2ReferenceEncoder(
-        _load_audio_vae(checkpoint, config, device=worker_device),
+        load_audio_vae(checkpoint, config, device=worker_device),
         patch_size=config.patch_size,
         cache_model_identity=str(model_path),
     )
@@ -109,12 +105,9 @@ def create_tts_engine_executor(
     dtype: str = "bfloat16",
     inference_timesteps: int = C.DEFAULT_INFERENCE_TIMESTEPS,
     cfg_value: float = C.DEFAULT_CFG_VALUE,
-    min_len: int = C.DEFAULT_MIN_LEN,
-    max_len: int = C.DEFAULT_MAX_LEN,
     max_running_requests: int = 1,
     server_args_overrides: dict[str, object] | None = None,
 ) -> object:
-    del min_len, max_len  # per-request, resolved in the runner from the payload
     from sglang_omni.models.voxcpm2.engine_builder import VoxCPM2EngineBuilder
 
     builder = VoxCPM2EngineBuilder(
@@ -143,10 +136,10 @@ def create_vocoder_executor(
 ) -> object:
     from sglang_omni.models.voxcpm2.streaming_vocoder import VoxCPM2StreamingVocoder
 
-    checkpoint, config = _resolved(model_path)
+    checkpoint, config = resolve_model_config(model_path)
     worker_device = device if gpu_id is None else f"{device}:{gpu_id}"
     vocoder = VoxCPM2StreamingVocoder(
-        _load_audio_vae(checkpoint, config, device=worker_device),
+        load_audio_vae(checkpoint, config, device=worker_device),
         device=worker_device,
         patch_size=config.patch_size,
         stream_stride=stream_stride,

@@ -17,7 +17,7 @@ from sglang_omni.models.weight_loader import resolve_model_path
 VOXCPM2_MODEL_TYPE = "voxcpm2"
 VOXCPM2_MODEL_ARCH_OVERRIDE = "VoxCPM2SGLangModel"
 
-_voxcpm2_hf_config_registered = False
+voxcpm2_hf_config_registered = False
 
 
 @dataclass
@@ -67,16 +67,16 @@ def load_voxcpm2_config(
     with (root / C.CONFIG_FILE).open("r", encoding="utf-8") as handle:
         raw: dict[str, Any] = json.load(handle) or {}
 
-    def _section(key: str) -> dict[str, Any]:
+    def section(key: str) -> dict[str, Any]:
         value = raw.get(key)
         return dict(value) if isinstance(value, dict) else {}
 
     return VoxCPM2RuntimeConfig(
         model_path=str(model_path),
-        lm=_section("lm_config"),
-        encoder=_section("encoder_config"),
-        dit=_section("dit_config"),
-        audio_vae=_section("audio_vae_config"),
+        lm=section("lm_config"),
+        encoder=section("encoder_config"),
+        dit=section("dit_config"),
+        audio_vae=section("audio_vae_config"),
         patch_size=int(raw.get("patch_size", C.PATCH_SIZE)),
         feat_dim=int(raw.get("feat_dim", C.FEAT_DIM)),
         residual_lm_num_layers=int(raw.get("residual_lm_num_layers", 0)),
@@ -160,14 +160,14 @@ class VoxCPM2Config(PretrainedConfig):
 
 def register_voxcpm2_hf_config() -> None:
     """Register the local VoxCPM2 config before SGLang builds its ModelConfig."""
-    global _voxcpm2_hf_config_registered
-    if _voxcpm2_hf_config_registered:
+    global voxcpm2_hf_config_registered
+    if voxcpm2_hf_config_registered:
         return
 
     from transformers import AutoConfig
 
     AutoConfig.register(VOXCPM2_MODEL_TYPE, VoxCPM2Config, exist_ok=True)
-    _voxcpm2_hf_config_registered = True
+    voxcpm2_hf_config_registered = True
 
 
 __all__ = [

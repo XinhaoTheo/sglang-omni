@@ -13,7 +13,9 @@ def _factory_dependencies(monkeypatch, *, fail_warmup=False):
     objects = []
     vae = object()
     monkeypatch.setattr(
-        stages, "_resolved", lambda _: ("checkpoint", SimpleNamespace(patch_size=4))
+        stages,
+        "resolve_model_config",
+        lambda _: ("checkpoint", SimpleNamespace(patch_size=4)),
     )
 
     def load_vae(checkpoint, config, *, device):
@@ -49,7 +51,7 @@ def _factory_dependencies(monkeypatch, *, fail_warmup=False):
         calls.append(("scheduler", kwargs))
         return SimpleNamespace(fn=fn, **kwargs)
 
-    monkeypatch.setattr(stages, "_load_audio_vae", load_vae)
+    monkeypatch.setattr(stages, "load_audio_vae", load_vae)
     monkeypatch.setattr(stages, "VoxCPM2ReferenceEncoder", Encoder)
     monkeypatch.setattr(streaming_vocoder, "VoxCPM2StreamingVocoder", Vocoder)
     monkeypatch.setattr(stages, "SimpleScheduler", scheduler)
@@ -185,3 +187,19 @@ def test_replica_plan_injects_each_gpu_into_all_audio_factories(tmp_path, device
                     assert kwargs["gpu_id"] == device
     finally:
         prepared.runtime_dir.close()
+
+
+@pytest.mark.parametrize(
+    "factory_name, option, value",
+    [
+        ("create_reference_encode_executor", "dtype", "bfloat16"),
+        ("create_reference_encode_executor", "max_batch_size", 8),
+        ("create_reference_encode_executor", "max_batch_wait_ms", 10),
+        ("create_tts_engine_executor", "min_len", 2),
+        ("create_tts_engine_executor", "max_len", 2000),
+    ],
+)
+def test_factories_reject_unsupported_options(factory_name, option, value):
+    factory = getattr(stages, factory_name)
+    with pytest.raises(TypeError, match=option):
+        factory("model", **{option: value})

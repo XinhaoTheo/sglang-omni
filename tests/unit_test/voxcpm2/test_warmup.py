@@ -68,4 +68,4 @@ def test_warmup_does_not_leave_per_request_state_behind():
         _RecordingAudioVAE(), device="cpu", patch_size=_PATCH_SIZE, stream_stride=4
     )
     vocoder.warmup_now()
-    assert vocoder._stream_states == {}
+    assert vocoder.stream_states == {}

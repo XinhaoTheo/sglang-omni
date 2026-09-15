@@ -12,7 +12,7 @@ from sglang_omni.config import (
 from sglang_omni.models.voxcpm2 import constants as C
 from sglang_omni.platforms import current_platform
 
-_PKG = "sglang_omni.models.voxcpm2"
+MODEL_PACKAGE = "sglang_omni.models.voxcpm2"
 PREPROCESSING_STAGE = "preprocessing"
 REFERENCE_ENCODE_STAGE = "reference_encode"
 ENGINE_STAGE = "tts_engine"
@@ -32,19 +32,17 @@ class VoxCPM2PipelineConfig(PipelineConfig):
         StageConfig(
             name=PREPROCESSING_STAGE,
             process="pipeline",
-            factory_path=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_path=f"{MODEL_PACKAGE}.stages.create_preprocessing_executor",
             factory=FactoryArgs(max_concurrency=8),
             next=REFERENCE_ENCODE_STAGE,
         ),
         StageConfig(
             name=REFERENCE_ENCODE_STAGE,
             process="pipeline",
-            factory_path=f"{_PKG}.stages.create_reference_encode_executor",
+            factory_path=f"{MODEL_PACKAGE}.stages.create_reference_encode_executor",
             factory=FactoryArgs(
                 device=current_platform.device_type,
-                dtype="bfloat16",
-                max_batch_size=8,
-                max_batch_wait_ms=10,
+                max_concurrency=8,
             ),
             gpu=0,
             next=ENGINE_STAGE,
@@ -52,14 +50,12 @@ class VoxCPM2PipelineConfig(PipelineConfig):
         EngineStageConfig(
             name=ENGINE_STAGE,
             process="pipeline",
-            factory_path=f"{_PKG}.stages.create_tts_engine_executor",
+            factory_path=f"{MODEL_PACKAGE}.stages.create_tts_engine_executor",
             factory=FactoryArgs(
                 device=current_platform.device_type,
                 dtype="bfloat16",
                 inference_timesteps=C.DEFAULT_INFERENCE_TIMESTEPS,
                 cfg_value=C.DEFAULT_CFG_VALUE,
-                min_len=C.DEFAULT_MIN_LEN,
-                max_len=C.DEFAULT_MAX_LEN,
             ),
             gpu=0,
             next=VOCODER_STAGE,
@@ -68,7 +64,7 @@ class VoxCPM2PipelineConfig(PipelineConfig):
         StageConfig(
             name=VOCODER_STAGE,
             process="pipeline",
-            factory_path=f"{_PKG}.stages.create_vocoder_executor",
+            factory_path=f"{MODEL_PACKAGE}.stages.create_vocoder_executor",
             factory=FactoryArgs(
                 device=current_platform.device_type,
                 max_batch_size=4,

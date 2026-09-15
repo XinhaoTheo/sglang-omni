@@ -74,7 +74,7 @@ def _item(patch: torch.Tensor, chunk_id: int) -> StreamItem:
 
 def _open(vocoder, request_id="req"):
     """Register the request the way the scheduler does before any chunk."""
-    vocoder._handle_streaming_new_request(request_id, _FakePayload(request_id))
+    vocoder.handle_streaming_new_request(request_id, _FakePayload(request_id))
 
 
 def _feed(vocoder, count, *, request_id="req"):
@@ -148,7 +148,7 @@ def test_overlap_is_decoded_again_and_dropped_from_the_output():
     vocoder = _vocoder(stream_stride=4, stream_followup_stride=2, overlap_patches=1)
     _open(vocoder)
     emitted = _feed(vocoder, 6)
-    vae = vocoder._vae
+    vae = vocoder.vae
 
     # Second window re-decodes the 1 overlap patch plus the 2 new ones.
     assert vae.decode_calls[-1] == 3 * _PATCH_SIZE
@@ -210,8 +210,8 @@ def test_clearing_one_request_leaves_the_other_alone():
     _feed(vocoder, 3, request_id="b")
 
     vocoder.clear_stream_state("a")
-    assert "a" not in vocoder._stream_states
-    assert "b" in vocoder._stream_states
+    assert "a" not in vocoder.stream_states
+    assert "b" in vocoder.stream_states
 
 
 def test_clearing_is_idempotent():
@@ -242,7 +242,7 @@ def test_stream_samples_match_full_decode_without_prompt_or_duplicate_tail(conte
     )
     payload = _FakePayload("req")
     payload.data["context_len"] = context_len
-    vocoder._handle_streaming_new_request("req", payload)
+    vocoder.handle_streaming_new_request("req", payload)
     patches = [_patch(index + 1) for index in range(context_len + 7)]
     messages = []
     for index, patch in enumerate(patches):
@@ -252,7 +252,7 @@ def test_stream_samples_match_full_decode_without_prompt_or_duplicate_tail(conte
         if index < context_len + 3:
             assert emitted == []
         messages.extend(emitted)
-    vocoder._handle_stream_done("req")
+    vocoder.handle_stream_done("req")
     while not vocoder.outbox.empty():
         messages.append(vocoder.outbox.get_nowait())
     audio = np.concatenate([_audio(m) for m in messages if m.type == "stream"])
@@ -261,7 +261,7 @@ def test_stream_samples_match_full_decode_without_prompt_or_duplicate_tail(conte
     )
     np.testing.assert_array_equal(audio, expected)
     assert [m.type for m in messages].count("result") == 1
-    assert "req" not in vocoder._stream_states
+    assert "req" not in vocoder.stream_states
 
 
 def test_stream_rejects_context_changes():
@@ -292,7 +292,7 @@ def test_full_and_fallback_decode_trim_the_same_prompt_context():
         "req", payload, vocoder.create_stream_state("req")
     )
     torch.testing.assert_close(fallback.flatten(), expected)
-    result = vocoder._decode_payload(payload)
+    result = vocoder.decode_payload(payload)
     np.testing.assert_array_equal(
         np.frombuffer(result.data["audio_waveform"], dtype=np.float32), expected.numpy()
     )

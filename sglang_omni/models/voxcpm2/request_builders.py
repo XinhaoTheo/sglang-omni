@@ -27,32 +27,26 @@ class VoxCPM2PreprocessingContext:
     tokenizer: Any
 
 
-_CONTEXT: VoxCPM2PreprocessingContext | None = None
+PREPROCESSING_CONTEXT: VoxCPM2PreprocessingContext | None = None
 
 
 def set_voxcpm2_preprocessing_context(context: VoxCPM2PreprocessingContext) -> None:
-    global _CONTEXT
-    _CONTEXT = context
+    global PREPROCESSING_CONTEXT
+    PREPROCESSING_CONTEXT = context
 
 
-def _get_context() -> VoxCPM2PreprocessingContext:
-    if _CONTEXT is None:
-        raise RuntimeError("VoxCPM2 preprocessing context is not initialized")
-    return _CONTEXT
-
-
-def _dict(value: Any) -> dict[str, Any]:
+def as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _first(*values: Any, default: Any) -> Any:
+def first_non_none(*values: Any, default: Any) -> Any:
     for value in values:
         if value is not None:
             return value
     return default
 
 
-def _reference_source(reference: dict[str, Any]) -> str | None:
+def reference_source(reference: dict[str, Any]) -> str | None:
     for key in ("audio_path", "path", "url"):
         value = reference.get(key)
         if value:
@@ -68,10 +62,12 @@ def build_voxcpm2_state(
     # note (Xinhao Tan): the speech endpoint hands over a bare string when the
     # request carries no reference audio, and a dict only when it does, so a
     # zero-shot request arrives in a different shape from a cloning one.
-    inputs = {"text": raw_inputs} if isinstance(raw_inputs, str) else _dict(raw_inputs)
-    params = _dict(payload.request.params)
-    tts_params = _dict(_dict(payload.request.metadata).get("tts_params"))
-    engine_params = _dict(_dict(params.get("stage_params")).get("tts_engine"))
+    inputs = (
+        {"text": raw_inputs} if isinstance(raw_inputs, str) else as_dict(raw_inputs)
+    )
+    params = as_dict(payload.request.params)
+    tts_params = as_dict(as_dict(payload.request.metadata).get("tts_params"))
+    engine_params = as_dict(as_dict(params.get("stage_params")).get("tts_engine"))
 
     target_text = str(inputs.get("text") or "").strip()
     if not target_text:
@@ -87,7 +83,7 @@ def build_voxcpm2_state(
         and isinstance(references[0], dict)
         else {}
     )
-    source = _reference_source(reference)
+    source = reference_source(reference)
     # note (Xinhao Tan): a reference carrying no audio cannot be reported later
     # without guessing. Downstream it either loads nothing and the request is
     # answered in some unrelated voice, or the encode stage fails on the path
@@ -137,7 +133,7 @@ def build_voxcpm2_state(
         patch_size=config.patch_size,
         feat_dim=config.feat_dim,
         inference_timesteps=int(
-            _first(
+            first_non_none(
                 engine_params.get("inference_timesteps"),
                 tts_params.get("inference_timesteps"),
                 params.get("inference_timesteps"),
@@ -145,16 +141,18 @@ def build_voxcpm2_state(
             )
         ),
         cfg_value=float(
-            _first(
+            first_non_none(
                 engine_params.get("cfg_value"),
                 tts_params.get("cfg_value"),
                 params.get("cfg_value"),
                 default=C.DEFAULT_CFG_VALUE,
             )
         ),
-        min_len=int(_first(engine_params.get("min_len"), default=C.DEFAULT_MIN_LEN)),
+        min_len=int(
+            first_non_none(engine_params.get("min_len"), default=C.DEFAULT_MIN_LEN)
+        ),
         max_len=int(
-            _first(
+            first_non_none(
                 engine_params.get("max_len"),
                 tts_params.get("max_len"),
                 params.get("max_len"),
@@ -162,7 +160,7 @@ def build_voxcpm2_state(
                 default=C.DEFAULT_MAX_LEN,
             )
         ),
-        seed=_first(tts_params.get("seed"), params.get("seed"), default=None),
+        seed=first_non_none(tts_params.get("seed"), params.get("seed"), default=None),
         stream=bool(params.get("stream")),
     )
 
@@ -177,7 +175,7 @@ class VoxCPM2PrefillInputs:
     audio_mask: torch.Tensor
 
 
-def _ref_prefix(
+def ref_prefix(
     ref_latents: torch.Tensor, *, start_id: int, end_id: int, feat_dim: int
 ) -> VoxCPM2PrefillInputs:
     """Wrap reference latents in their start/end tokens, padded at both edges."""
@@ -228,7 +226,7 @@ def build_prefill_inputs(
     audio_masks = [torch.zeros(text_length, dtype=torch.int32)]
 
     if state.ref_latents is not None:
-        prefix = _ref_prefix(
+        prefix = ref_prefix(
             torch.as_tensor(state.ref_latents),
             start_id=int(tokenizer.convert_tokens_to_ids(C.AUDIO_PROMPT_START_TOKEN)),
             end_id=int(tokenizer.convert_tokens_to_ids(C.AUDIO_PROMPT_END_TOKEN)),
@@ -379,7 +377,6 @@ def build_stream_output(
     request_id: str, data: VoxCPM2SGLangRequestData, req_output: Any
 ) -> Iterator[OutgoingMessage]:
     """Emit the patch the step that just finished sampled, one chunk at a time."""
-    del req_output
     if not data.state.stream:
         return
     # note (Xinhao Tan): the patch rides as a bare tensor, not wrapped in a
@@ -417,7 +414,9 @@ def apply_voxcpm2_result(data: VoxCPM2SGLangRequestData) -> StagePayload:
 
 def preprocess_voxcpm2_payload(payload: StagePayload) -> StagePayload:
     """Preprocessing-stage entry point: validate the request and tokenize text."""
-    state = build_voxcpm2_state(payload, _get_context())
+    if PREPROCESSING_CONTEXT is None:
+        raise RuntimeError("VoxCPM2 preprocessing context is not initialized")
+    state = build_voxcpm2_state(payload, PREPROCESSING_CONTEXT)
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
