@@ -46,6 +46,7 @@ def _generation_request(*, patches=0, min_len=2, max_len=8):
             state=VoxCPM2State(min_len=min_len, max_len=max_len),
             cond=None,
             next_embed=None,
+            decode_input_embeds=[],
             noise_generator=None,
             latent_patches=[torch.zeros(4, 8) for _ in range(patches)],
             finish_reason=None,
@@ -105,6 +106,8 @@ class _PrefillData:
     def __init__(self, length, prefix_indices):
         self.prefill = _Prefill(length)
         self.req = _PrefixReq(prefix_indices)
+        self.req.extend_range = SimpleNamespace(length=length)
+        self.decode_input_embeds = []
 
 
 class _PrefillRequest:

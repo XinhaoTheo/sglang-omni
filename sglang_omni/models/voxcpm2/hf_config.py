@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -190,7 +191,7 @@ def stage_checkpoint_for_autoconfig(checkpoint: str) -> str:
     this stages a sibling directory that symlinks the weights and carries a
     config of its own.
     """
-    root = Path(checkpoint)
+    root = Path(checkpoint).resolve()
     raw = json.loads((root / C.CONFIG_FILE).read_text(encoding="utf-8"))
     if raw.get("model_type") == VOXCPM2_MODEL_TYPE:
         return checkpoint
@@ -201,6 +202,15 @@ def stage_checkpoint_for_autoconfig(checkpoint: str) -> str:
         if entry.name == C.CONFIG_FILE:
             continue
         link = staged / entry.name
+        if link.is_symlink() and not link.exists():
+            # note (Xinhao Tan): stale links survive the existence guard below.
+            # Publish their replacement atomically so concurrent loaders never
+            # observe a missing path between unlink and symlink creation.
+            with tempfile.TemporaryDirectory(prefix=".link-", dir=staged) as tmp:
+                replacement = Path(tmp) / entry.name
+                replacement.symlink_to(entry)
+                replacement.replace(link)
+            continue
         # note (Xinhao Tan): exists() is false for dangling symlinks. Another
         # builder can also create the link between this check and symlink_to().
         if link.is_symlink() or link.exists():
@@ -211,5 +221,10 @@ def stage_checkpoint_for_autoconfig(checkpoint: str) -> str:
             pass
 
     raw["model_type"] = VOXCPM2_MODEL_TYPE
-    (staged / C.CONFIG_FILE).write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    # note (Xinhao Tan): another engine may read this directory during startup.
+    # Writing the visible config in place exposes empty or incomplete JSON.
+    with tempfile.TemporaryDirectory(prefix=".config-", dir=staged) as tmp:
+        config = Path(tmp) / C.CONFIG_FILE
+        config.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        config.replace(staged / C.CONFIG_FILE)
     return str(staged)

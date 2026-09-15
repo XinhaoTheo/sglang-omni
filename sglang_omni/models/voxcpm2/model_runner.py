@@ -50,6 +50,7 @@ class VoxCPM2ModelRunner(ModelRunner):
         if not requests:
             return
         embeds = []
+        masks = []
         for request in requests:
             prefill = request.data.prefill
             # note (Xinhao Tan): embeddings and masks cover the full prompt,
@@ -60,21 +61,33 @@ class VoxCPM2ModelRunner(ModelRunner):
                     "VoxCPM2 does not support radix prefix reuse: "
                     f"{reused} positions were reused"
                 )
-            embeds.append(
-                self.model.build_input_embeds(
-                    prefill.text_token,
-                    prefill.audio_feat,
-                    prefill.text_mask,
-                    prefill.audio_mask,
-                )
+            prompt = self.model.build_input_embeds(
+                prefill.text_token,
+                prefill.audio_feat,
+                prefill.text_mask,
+                prefill.audio_mask,
             )
+            mask = prefill.audio_mask
+            generated = int(request.data.req.extend_range.length) - len(prompt)
+            history = request.data.decode_input_embeds
+            if generated < 0 or len(history) != generated:
+                raise RuntimeError(
+                    "VoxCPM2 prefill audio history mismatch: "
+                    f"have {len(history)} rows, need {generated}"
+                )
+            if generated:
+                # note (Xinhao Tan): retraction frees KV but keeps output IDs.
+                # Rebuild those audio positions from their original embeddings
+                # without sampling old patches again or advancing their RNG.
+                prompt = torch.cat((prompt, torch.stack(history)), dim=0)
+                mask = torch.cat((mask, mask.new_ones(generated)), dim=0)
+            embeds.append(prompt)
+            masks.append(mask)
         attach_omni_prefill_inputs(
             forward_batch,
             OmniPrefillInputs(
                 input_embeds=torch.cat(embeds, dim=0),
-                audio_mask=torch.cat(
-                    [request.data.prefill.audio_mask for request in requests], dim=0
-                ),
+                audio_mask=torch.cat(masks, dim=0),
             ),
         )
 
@@ -156,6 +169,9 @@ class VoxCPM2ModelRunner(ModelRunner):
             patch = patches[index]
             data.cond = patch
             data.next_embed = embeddings[index]
+            # note (Xinhao Tan): retain the newest feedback too: a request can
+            # be retracted before that embedding is consumed by decode.
+            data.decode_input_embeds.append(data.next_embed.detach().clone())
             data.latent_patches.append(patch.squeeze(0).detach().cpu())
             state = data.state
             steps = len(data.latent_patches)

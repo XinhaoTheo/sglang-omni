@@ -117,7 +117,11 @@ def build_voxcpm2_state(
     text = prompt_text + target_text if prompt_text else target_text
     tokenizer = context.tokenizer
     audio_start_id = int(tokenizer.convert_tokens_to_ids(C.AUDIO_START_TOKEN))
-    text_ids = list(tokenizer(text)["input_ids"]) + [audio_start_id]
+    # note (Xinhao Tan): upstream converts text tokens directly to IDs. The
+    # checkpoint tokenizer otherwise prepends BOS, changing the AR prefix.
+    text_ids = list(tokenizer(text, add_special_tokens=False)["input_ids"]) + [
+        audio_start_id
+    ]
 
     config = context.config
     return VoxCPM2State(
@@ -127,7 +131,9 @@ def build_voxcpm2_state(
         prompt_audio=prompt_audio,
         reference_audio=reference_audio,
         text_token=torch.tensor(text_ids, dtype=torch.int32),
-        target_text_length=len(tokenizer(target_text)["input_ids"]),
+        target_text_length=len(
+            tokenizer(target_text, add_special_tokens=False)["input_ids"]
+        ),
         patch_size=config.patch_size,
         feat_dim=config.feat_dim,
         inference_timesteps=int(

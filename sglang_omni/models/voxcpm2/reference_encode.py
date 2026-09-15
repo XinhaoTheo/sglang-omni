@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+import io
+import os
+from urllib.parse import unquote, urlparse
+
+import httpx
+import librosa
 import torch
 import torch.nn.functional as F
 
@@ -16,7 +22,31 @@ from sglang_omni.scheduling.reference_encoder import (
     ReferenceEncodeService,
     TensorReferenceEncodeHook,
 )
-from sglang_omni.utils.audio import load_audio
+from sglang_omni.utils.audio import decode_audio_data_uri
+
+
+def _load_reference_audio(source: str, sample_rate: int):
+    # note (Xinhao Tan): upstream uses librosa to resample reference audio.
+    # The shared torchaudio resampler changes encoded reference features and
+    # caused repeated speech in the reference-English regression samples.
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        source = io.BytesIO(bytes(source))
+    else:
+        raw = decode_audio_data_uri(source)
+        if raw is not None:
+            source = io.BytesIO(raw)
+        elif source.startswith(("http://", "https://")):
+            try:
+                timeout = max(1, int(os.getenv("REQUEST_TIMEOUT", "5")))
+            except ValueError:
+                timeout = 5
+            response = httpx.get(source, timeout=timeout, follow_redirects=True)
+            response.raise_for_status()
+            source = io.BytesIO(response.content)
+        elif source.startswith("file://"):
+            source = unquote(urlparse(source).path)
+    audio, _ = librosa.load(source, sr=sample_rate, mono=True)
+    return audio
 
 
 class _VoxCPM2ReferenceEncodeHook(TensorReferenceEncodeHook[tuple[str, str]]):
@@ -32,7 +62,7 @@ class _VoxCPM2ReferenceEncodeHook(TensorReferenceEncodeHook[tuple[str, str]]):
         self._encoder = encoder
         self.model_id = str(model_identity)
         self.encoder_config_hash = (
-            f"sr{encoder.sample_rate}:patch{encoder.patch_size}:"
+            f"librosa:sr{encoder.sample_rate}:patch{encoder.patch_size}:"
             f"latent{encoder.latent_dim}"
         )
 
@@ -90,7 +120,7 @@ class VoxCPM2ReferenceEncoder:
 
     def encode_audio(self, source: str, *, padding_side: str) -> torch.Tensor:
         """Encode one audio source into ``[frames, patch_size, latent_dim]``."""
-        audio = load_audio(source, target_sample_rate=self.sample_rate, mono=True)
+        audio = _load_reference_audio(source, self.sample_rate)
         waveform = torch.from_numpy(audio).unsqueeze(0)
 
         # note (Xinhao Tan): the padding side is not free. Upstream pads

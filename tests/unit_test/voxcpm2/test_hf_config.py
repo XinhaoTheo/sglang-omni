@@ -141,10 +141,51 @@ def test_staging_twice_is_idempotent(tmp_path):
 
 
 def test_a_dangling_link_left_behind_does_not_break_staging(tmp_path):
-    """exists() follows a link, so a broken one reads as absent."""
+    """A returned checkpoint must expose readable weights, not a stale link."""
     root = _checkpoint(tmp_path / "snap")
     staged = tmp_path / "snap-sglang-omni"
     staged.mkdir()
     (staged / "model.safetensors").symlink_to(tmp_path / "gone")
 
     assert stage_checkpoint_for_autoconfig(str(root)) == str(staged)
+    assert (staged / "model.safetensors").read_bytes() == b"weights"
+
+
+def test_staging_a_relative_checkpoint_keeps_weight_links_readable(
+    tmp_path, monkeypatch
+):
+    _checkpoint(tmp_path / "snap")
+    monkeypatch.chdir(tmp_path)
+    staged = Path(stage_checkpoint_for_autoconfig("snap"))
+    assert (staged / "model.safetensors").read_bytes() == b"weights"
+
+
+def test_staging_never_exposes_a_partially_written_config(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    root = _checkpoint(tmp_path / "snap")
+    staged = Path(stage_checkpoint_for_autoconfig(str(root)))
+    original_write = Path.write_text
+    opened, release = Event(), Event()
+
+    def paused_write(path, data, *args, **kwargs):
+        if path.name == "config.json" and path != root / "config.json":
+            # note (Xinhao Tan): hold the writer here so the reader reliably
+            # checks the interval that used to expose an empty config.
+            with path.open("w", encoding="utf-8"):
+                opened.set()
+                assert release.wait(5)
+        return original_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", paused_write)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(stage_checkpoint_for_autoconfig, str(root))
+        try:
+            assert opened.wait(5)
+            assert json.loads((staged / "config.json").read_text())["model_type"] == (
+                VOXCPM2_MODEL_TYPE
+            )
+        finally:
+            release.set()
+        assert future.result() == str(staged)

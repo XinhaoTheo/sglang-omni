@@ -31,8 +31,9 @@ _TOKEN_IDS = {
 class _FakeTokenizer:
     """Character-per-token stand-in; ids are the character codes."""
 
-    def __call__(self, text):
-        return {"input_ids": [ord(ch) for ch in text]}
+    def __call__(self, text, *, add_special_tokens=True):
+        ids = [ord(ch) for ch in text]
+        return {"input_ids": ([1] if add_special_tokens else []) + ids}
 
     def convert_tokens_to_ids(self, token):
         return _TOKEN_IDS[token]
@@ -67,6 +68,19 @@ def _context():
 def _state_for(references):
     payload = _FakePayload(_FakeRequest({"text": "hi", "references": references}))
     return build_voxcpm2_state(payload, _context())
+
+
+@pytest.mark.parametrize("transcript", [None, "reference words"])
+def test_text_prefix_and_target_length_exclude_automatic_bos(transcript):
+    references = (
+        [{"audio_path": "reference.wav", "text": transcript}]
+        if transcript is not None
+        else []
+    )
+    state = _state_for(references)
+    expected_text = (transcript or "") + "hi"
+    assert state.text_token.tolist() == [ord(ch) for ch in expected_text] + [101]
+    assert state.target_text_length == 2
 
 
 def _speech_state(**kwargs):
