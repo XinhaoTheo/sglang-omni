@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from sglang_omni.models.minimax_music3.acoustic import (
     MiniMaxMusic3AcousticScheduler,
-    _resolve_acoustic_dtype,
+    resolve_acoustic_dtype,
 )
 from sglang_omni.models.minimax_music3.chunking import chunk_windows
 from sglang_omni.models.minimax_music3.config import (
@@ -26,10 +26,10 @@ from sglang_omni.models.minimax_music3.dit import (
     Attention,
     MiniMaxMusic3DIT,
     RotaryEmbedding,
-    _apply_rope,
-    _resolve_attention_backend,
+    apply_rope,
+    resolve_attention_backend,
 )
-from sglang_omni.models.minimax_music3.model_runner import _HiddenFrameBuffer
+from sglang_omni.models.minimax_music3.model_runner import HiddenFrameBuffer
 from sglang_omni.models.minimax_music3.rvq_cuda_graph import RVQDepthCudaGraphRunner
 from sglang_omni.models.minimax_music3.rvq_decoder import sample_topk_seeded
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
@@ -62,7 +62,7 @@ def test_chunk_windows_cover_boundaries(
 
 
 def test_hidden_frame_buffer_uses_absolute_indexes_after_discard() -> None:
-    buffer = _HiddenFrameBuffer()
+    buffer = HiddenFrameBuffer()
     for frame in range(201):
         buffer.append(torch.full((2,), frame, dtype=torch.float32))
 
@@ -130,13 +130,13 @@ def test_sample_topk_seeded_advances_with_the_draw_position() -> None:
 def test_resolve_acoustic_dtype(
     value: str | torch.dtype, expected: torch.dtype
 ) -> None:
-    assert _resolve_acoustic_dtype(value) is expected
+    assert resolve_acoustic_dtype(value) is expected
 
 
 @pytest.mark.parametrize("value", ["float16", "int8", None])
 def test_resolve_acoustic_dtype_rejects_unsupported_values(value: object) -> None:
     with pytest.raises(ValueError, match="float32.*bfloat16|bfloat16.*float32"):
-        _resolve_acoustic_dtype(value)  # type: ignore[arg-type]
+        resolve_acoustic_dtype(value)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -151,12 +151,12 @@ def test_resolve_acoustic_dtype_rejects_unsupported_values(value: object) -> Non
 def test_resolve_attention_backend(
     value: str, expected: AttentionBackendEnum | None
 ) -> None:
-    assert _resolve_attention_backend(value) is expected
+    assert resolve_attention_backend(value) is expected
 
 
 def test_resolve_attention_backend_rejects_unknown_value() -> None:
     with pytest.raises(ValueError, match="attention_backend"):
-        _resolve_attention_backend("flashinfer")
+        resolve_attention_backend("flashinfer")
 
 
 def test_minimax_music3_explicit_placements_ignore_the_machine(
@@ -290,8 +290,8 @@ def test_native_sdpa_matches_reference_without_diffusion_server_args() -> None:
 
     q, k, v = module.to_qkv(x).chunk(3, dim=-1)
     rope_cos, rope_sin = freqs.cos(), freqs.sin()
-    q = _apply_rope(q.view(2, 19, 2, 64).transpose(1, 2), rope_cos, rope_sin)
-    k = _apply_rope(k.view(2, 19, 2, 64).transpose(1, 2), rope_cos, rope_sin)
+    q = apply_rope(q.view(2, 19, 2, 64).transpose(1, 2), rope_cos, rope_sin)
+    k = apply_rope(k.view(2, 19, 2, 64).transpose(1, 2), rope_cos, rope_sin)
     v = v.view(2, 19, 2, 64).transpose(1, 2)
     expected = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     expected = module.to_out(expected.transpose(1, 2).contiguous().view(2, 19, 128))
@@ -382,7 +382,7 @@ def test_rvq_cuda_graph_declines_a_batch_larger_than_every_bucket() -> None:
     assert runner(oversized, zeros, zeros, zeros, forced, replay) is None
 
 
-class _TinyCacheBlock(torch.nn.Module):
+class TinyCacheBlock(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.proj = torch.nn.Linear(16, 16)
@@ -391,10 +391,10 @@ class _TinyCacheBlock(torch.nn.Module):
         return x + self.proj(x) * scale
 
 
-class _TinyCacheTransformer(torch.nn.Module):
+class TinyCacheTransformer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.layers = torch.nn.ModuleList([_TinyCacheBlock() for _ in range(4)])
+        self.layers = torch.nn.ModuleList([TinyCacheBlock() for _ in range(4)])
 
     def forward(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
@@ -402,10 +402,10 @@ class _TinyCacheTransformer(torch.nn.Module):
         return x
 
 
-class _TinyCacheDiffusion(torch.nn.Module):
+class TinyCacheDiffusion(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.transformer = _TinyCacheTransformer()
+        self.transformer = TinyCacheTransformer()
 
 
 @pytest.mark.accelerator
@@ -413,7 +413,7 @@ class _TinyCacheDiffusion(torch.nn.Module):
 def test_cache_dit_block_adapter_runs_hidden_only_pattern() -> None:
     model = MiniMaxMusic3DIT.__new__(MiniMaxMusic3DIT)
     torch.nn.Module.__init__(model)
-    model.diffusion_transformer = _TinyCacheDiffusion().cuda().eval()
+    model.diffusion_transformer = TinyCacheDiffusion().cuda().eval()
     model.enable_cache_dit(
         num_steps=4,
         fn_compute_blocks=1,
@@ -432,28 +432,28 @@ def test_cache_dit_block_adapter_runs_hidden_only_pattern() -> None:
     assert torch.isfinite(x).all()
 
 
-class _ZeroDiffusionTransformer(torch.nn.Module):
+class ZeroDiffusionTransformer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
 
-    def _transformer(
-        self, x: torch.Tensor, _t: torch.Tensor, _condition: torch.Tensor
+    def _transformer(  # noqa: leading-underscore  # production name
+        self, x: torch.Tensor, _t: torch.Tensor, condition: torch.Tensor
     ) -> torch.Tensor:
         self.calls += 1
         return torch.zeros_like(x)
 
 
-def _tiny_dit() -> MiniMaxMusic3DIT:
+def tiny_dit() -> MiniMaxMusic3DIT:
     dit = MiniMaxMusic3DIT.__new__(MiniMaxMusic3DIT)
     torch.nn.Module.__init__(dit)
-    dit.diffusion_transformer = _ZeroDiffusionTransformer()
-    dit._bcg_runner = None
+    dit.diffusion_transformer = ZeroDiffusionTransformer()
+    dit.bcg_runner = None
     return dit
 
 
 def test_dit_step_count_is_configurable_without_changing_shape() -> None:
-    dit = _tiny_dit()
+    dit = tiny_dit()
     align = torch.zeros((1, 2048, 3))
 
     latent = dit(
@@ -468,7 +468,7 @@ def test_dit_step_count_is_configurable_without_changing_shape() -> None:
 
 
 def test_dit_aligned_mel_length_matches_full_window_contract() -> None:
-    dit = _tiny_dit()
+    dit = tiny_dit()
     dit.sr_input = 24_000
     dit.sr_output = 44_100
     dit.hop_size_input = 960
@@ -479,7 +479,7 @@ def test_dit_aligned_mel_length_matches_full_window_contract() -> None:
 
 
 def test_dit_abort_stops_before_the_next_euler_step() -> None:
-    dit = _tiny_dit()
+    dit = tiny_dit()
     checks = iter((False, False, True))
 
     with pytest.raises(InterruptedError, match="aborted"):
@@ -512,7 +512,7 @@ def test_acoustic_scheduler_rejects_malformed_hidden_before_decode() -> None:
         scheduler.on_stream_chunk("req", item)
 
 
-class _FakeAcousticDecoder:
+class FakeAcousticDecoder:
     def __init__(self) -> None:
         self.hidden_shape: tuple[int, ...] | None = None
 
@@ -524,7 +524,7 @@ class _FakeAcousticDecoder:
 
 
 def test_acoustic_scheduler_accepts_the_relay_tensor_shape() -> None:
-    decoder = _FakeAcousticDecoder()
+    decoder = FakeAcousticDecoder()
     scheduler = MiniMaxMusic3AcousticScheduler(decoder=decoder)  # type: ignore[arg-type]
     item = StreamItem(
         chunk_id=0,
@@ -562,7 +562,7 @@ def test_backbone_config_rewrite_does_not_write_through_a_symlink(
     config_path = snapshot / "config.json"
     config_path.symlink_to(blob)
 
-    MiniMaxMusic3EngineBuilder._normalize_backbone_config(config_path)
+    MiniMaxMusic3EngineBuilder.normalize_backbone_config(config_path)
 
     assert json.loads(blob.read_text())["model_type"] == "mixtral"
     assert not config_path.is_symlink()

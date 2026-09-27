@@ -27,9 +27,11 @@ class FunASRStreamingStrategy:
         return FunASRStreamingState(model_name=model_name, language=language)
 
     @staticmethod
-    def _state(state: object) -> FunASRStreamingState:
+    def state(state: object) -> FunASRStreamingState:
         if not isinstance(state, FunASRStreamingState):
             raise TypeError("Fun-ASR received incompatible streaming state")
+        else:
+            pass
         return state
 
     def build_decode_request(
@@ -41,20 +43,18 @@ class FunASRStreamingStrategy:
         request_id: str,
     ) -> GenerateRequest:
         del request_id
-        fun_state = self._state(state)
+        fun_state = self.state(state)
         # note (Xinhao Tan): rollback exists to leave a safety margin for
         # audio that has not arrived yet. On the final decode there is no
         # more audio coming, so rolling back only risks re-generating and
         # possibly corrupting text that may already be correct, for no
         # benefit — skip it and trust the accumulated transcript instead.
-        if is_final:
-            use_prefix = bool(fun_state.transcript)
-            rollback_chars = 0
-        else:
-            use_prefix = fun_state.chunk_id >= _UNFIXED_CHUNK_NUM and bool(
-                fun_state.transcript
-            )
-            rollback_chars = _ROLLBACK_CHARS if use_prefix else 0
+        # This only changes the rollback amount, not the _UNFIXED_CHUNK_NUM
+        # cold-start gate below.
+        use_prefix = fun_state.chunk_id >= _UNFIXED_CHUNK_NUM and bool(
+            fun_state.transcript
+        )
+        rollback_chars = 0 if is_final else (_ROLLBACK_CHARS if use_prefix else 0)
         request = build_speech_to_text_generate_request(
             audio_bytes=audio,
             filename="realtime-segment.wav",
@@ -84,9 +84,11 @@ class FunASRStreamingStrategy:
         language: str | None,
         state: object,
     ) -> str:
-        fun_state = self._state(state)
+        fun_state = self.state(state)
         if language:
             fun_state.language = language
+        else:
+            pass
         fun_state.transcript = generated_text
         fun_state.chunk_id += 1
         return generated_text

@@ -9,8 +9,8 @@ import torch
 
 import sglang_omni.preprocessing.transcription as transcription
 from sglang_omni.models.fun_asr.request_builders import (
-    _retained_streaming_prefix,
     make_fun_asr_scheduler_adapters,
+    retained_streaming_prefix,
 )
 from sglang_omni.models.fun_asr.streaming import FunASRStreamingStrategy
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -19,7 +19,7 @@ _AUDIO_PAD = "<|object_ref_start|>"
 _AUDIO_PAD_ID = 42
 
 
-class _CharTokenizer:
+class CharTokenizer:
     def __call__(self, text: str, *, add_special_tokens: bool = False):
         assert not add_special_tokens
         return SimpleNamespace(input_ids=[ord(char) for char in text])
@@ -43,19 +43,19 @@ class _CharTokenizer:
         ("in this", 4, [ord(c) for c in "in"], "in"),
     ],
 )
-def test_retained_streaming_prefix_rolls_back_chars(
+def testretained_streaming_prefix_rolls_back_chars(
     text: str,
     rollback_chars: int,
     expected_ids: list[int],
     expected_text: str,
 ) -> None:
-    assert _retained_streaming_prefix(_CharTokenizer(), text, rollback_chars) == (
+    assert retained_streaming_prefix(CharTokenizer(), text, rollback_chars) == (
         expected_ids,
         expected_text,
     )
 
 
-class _BuilderTokenizer:
+class BuilderTokenizer:
     eos_token_id = 151645
     vocab_size = 151936
 
@@ -85,7 +85,7 @@ class _BuilderTokenizer:
         return "".join(chr(token_id) for token_id in token_ids)
 
 
-def _feature_extractor(num_lfr_frames: int):
+def make_feature_extractor(num_lfr_frames: int):
     def _call(
         audio,
         sampling_rate=None,
@@ -110,9 +110,9 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
         lambda source, **kwargs: np.zeros(1600 * 3, dtype=np.float32),
     )
     request_builder, result_adapter = make_fun_asr_scheduler_adapters(
-        tokenizer=_BuilderTokenizer(),
+        tokenizer=BuilderTokenizer(),
         max_new_tokens=32,
-        feature_extractor=_feature_extractor(17),
+        feature_extractor=make_feature_extractor(17),
     )
     data = request_builder(
         StagePayload(
@@ -147,9 +147,9 @@ def test_request_builder_defaults_to_no_repetition_penalty_when_not_streaming(
         lambda source, **kwargs: np.zeros(1600 * 3, dtype=np.float32),
     )
     request_builder, _ = make_fun_asr_scheduler_adapters(
-        tokenizer=_BuilderTokenizer(),
+        tokenizer=BuilderTokenizer(),
         max_new_tokens=32,
-        feature_extractor=_feature_extractor(17),
+        feature_extractor=make_feature_extractor(17),
     )
     data = request_builder(
         StagePayload(
