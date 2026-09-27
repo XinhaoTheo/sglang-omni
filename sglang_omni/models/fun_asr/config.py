@@ -27,6 +27,8 @@ class FunASRPipelineConfig(PipelineConfig):
         RealtimeTranscriptionConfig(
             strategy_cls=FunASRStreamingStrategy,
             decode_interval_ms=720,
+            server_vad=True,
+            max_segment_s=30.0,
         )
     )
 
