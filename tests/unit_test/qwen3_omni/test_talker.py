@@ -28,10 +28,6 @@ from sglang_omni.models.qwen3_omni.config import (
     ENABLE_TALKER_START_TOPOLOGY,
     TALKER_START_MIN_CHUNKS,
 )
-from sglang_omni.models.qwen3_omni.pending_text_queue import (
-    PendingTextTensorQueue,
-    coerce_pending_text_queue,
-)
 from sglang_omni.models.qwen3_omni.request_builders import build_sglang_talker_request
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_omni.talker_scheduler import (
@@ -42,6 +38,10 @@ from sglang_omni.models.qwen3_omni.talker_scheduler import (
 from sglang_omni.proto.request import OmniRequest
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.pending_text_queue import (
+    PendingTextTensorQueue,
+    coerce_pending_text_queue,
+)
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from tests.unit_test.fixtures.qwen_fakes import FakeQwenTokenizer
 from tests.unit_test.fixtures.qwen_predictor import (
@@ -1119,7 +1119,7 @@ def test_topology_rechecks_deferred_payload_on_every_chunk() -> None:
 def test_process_input_requests_builds_at_one_chunk_under_topology() -> None:
 
     def stub_request_builder(payload: Any) -> Any:
-        origin_input_ids: list[int] = []
+        origin_input_ids: list[int] = [0]
         return SGLangARRequestData(
             req=SimpleNamespace(
                 rid=payload.request_id,
@@ -1503,7 +1503,7 @@ def test_process_input_requests_partial_build_state_machine() -> None:
 
     def stub_request_builder(payload: Any) -> Any:
         captured_done = bool(payload.prefetched_stream_done)
-        origin_input_ids: list[int] = []
+        origin_input_ids: list[int] = [0]
         req_data = SGLangARRequestData(
             req=SimpleNamespace(
                 rid=payload.request_id,
