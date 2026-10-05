@@ -24,6 +24,7 @@ from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.token_text_streaming import (
     make_token_text_stream_output_builder,
 )
+from sglang_omni.serve.transcription_chunking import is_spaced_script
 
 from .configuration_fun_asr import AUDIO_PLACEHOLDER_TOKEN as _AUDIO_PAD
 from .tool_funcs.audio_lengths import fun_asr_low_frame_rate_length
@@ -96,28 +97,41 @@ def decode_token_ids(
         return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
-def align_to_word_boundary(text: str, cut: int) -> int:
+def is_unspaced_script(char: str) -> bool:
+    return not char.isspace() and not is_spaced_script(char)
+
+
+def align_to_word_boundary(text: str, cut: int, token_end_offsets: set[int]) -> int:
     # note (Xinhao Tan): a raw char-count cut can land mid-word (e.g. "this"
-    # -> "thi"), forcing the model to continue from a fragment it can't
-    # reliably complete. Walk back to the nearest whitespace instead; no
-    # whitespace at all means roll back the whole run.
+    # -> "thi") or mid-token (e.g. 前方 -> 前), and the model then cannot
+    # continue the fragment. Unspaced scripts such as Chinese have no word
+    # spaces, so next to them the cut walks back to a token boundary instead.
     if cut <= 0 or cut >= len(text):
         return cut
     else:
         pass
-    if text[cut - 1].isspace() or text[cut].isspace():
-        return cut
-    else:
-        pass
-    while cut > 0 and not text[cut - 1].isspace():
-        cut -= 1
+    while cut > 0:
+        left_char = text[cut - 1]
+        right_char = text[cut]
+        if is_spaced_script(left_char) and is_spaced_script(right_char):
+            cut -= 1
+        elif (
+            is_unspaced_script(left_char) or is_unspaced_script(right_char)
+        ) and cut not in token_end_offsets:
+            cut -= 1
+        else:
+            break
     return cut
 
 
 def retained_streaming_prefix(
     tokenizer: Any, text: str, rollback_chars: int
 ) -> tuple[list[int], str]:
-    cut = align_to_word_boundary(text, max(len(text) - rollback_chars, 0))
+    encoding = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    token_end_offsets = {end for _, end in encoding.offset_mapping}
+    cut = align_to_word_boundary(
+        text, max(len(text) - rollback_chars, 0), token_end_offsets
+    )
     # note (Xinhao Tan): drop a trailing boundary space here — the
     # continuation's own leading-space token supplies the separator, so
     # keeping both doubles up the whitespace between words.

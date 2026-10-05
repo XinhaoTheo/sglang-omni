@@ -19,10 +19,32 @@ _AUDIO_PAD = "<|object_ref_start|>"
 _AUDIO_PAD_ID = 42
 
 
-class CharTokenizer:
-    def __call__(self, text: str, *, add_special_tokens: bool = False):
+class PieceTokenizer:
+    """Tokenizes into the longest known piece at each position, else one char."""
+
+    def __init__(self, pieces: tuple[str, ...] = ()) -> None:
+        self.pieces = sorted(pieces, key=len, reverse=True)
+
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ):
         assert not add_special_tokens
-        return SimpleNamespace(input_ids=[ord(char) for char in text])
+        offset_mapping = []
+        start = 0
+        while start < len(text):
+            piece = next(
+                (piece for piece in self.pieces if text.startswith(piece, start)),
+                text[start],
+            )
+            offset_mapping.append((start, start + len(piece)))
+            start += len(piece)
+        return SimpleNamespace(
+            input_ids=[ord(char) for char in text], offset_mapping=offset_mapping
+        )
 
 
 @pytest.mark.parametrize(
@@ -41,16 +63,44 @@ class CharTokenizer:
         ("in this", 3, [ord(c) for c in "in"], "in"),
         # Cut already lands on a word boundary: same result.
         ("in this", 4, [ord(c) for c in "in"], "in"),
+        # Mixed script: Latin still never splits a word ("wo|rld").
+        ("我说hello world", 3, [ord(c) for c in "我说hello"], "我说hello"),
     ],
 )
-def testretained_streaming_prefix_rolls_back_chars(
+def test_retained_streaming_prefix_rolls_back_chars(
     text: str,
     rollback_chars: int,
     expected_ids: list[int],
     expected_text: str,
 ) -> None:
-    assert retained_streaming_prefix(CharTokenizer(), text, rollback_chars) == (
+    assert retained_streaming_prefix(PieceTokenizer(), text, rollback_chars) == (
         expected_ids,
+        expected_text,
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "rollback_chars", "expected_text"),
+    [
+        # Pieces below are the real Fun-ASR tokenization. The cut lands inside
+        # 转弯, so it backs up to the token start instead of keeping 转.
+        ("前方有左急转弯，请减速慢行。", 8, "前方有左急"),
+        # A cut inside a leading multi-character token rolls back everything.
+        ("不断提升安全业务能力。", 8, ""),
+        # A cut already on a token boundary is kept.
+        ("前方有左急转弯，请减速慢行。", 9, "前方有左急"),
+    ],
+)
+def test_retained_streaming_prefix_keeps_unspaced_tokens_whole(
+    text: str,
+    rollback_chars: int,
+    expected_text: str,
+) -> None:
+    tokenizer = PieceTokenizer(
+        ("前方", "转弯", "，请", "减速", "不断提升", "安全", "业务", "能力")
+    )
+    assert retained_streaming_prefix(tokenizer, text, rollback_chars) == (
+        [ord(char) for char in expected_text],
         expected_text,
     )
 
@@ -59,7 +109,13 @@ class BuilderTokenizer:
     eos_token_id = 151645
     vocab_size = 151936
 
-    def __call__(self, text: str, *, add_special_tokens: bool = False):
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = False,
+    ):
         assert not add_special_tokens
         if _AUDIO_PAD in text:
             audio_pad_count = text.count(_AUDIO_PAD)
@@ -69,7 +125,7 @@ class BuilderTokenizer:
                 + [15, 16, 17, 18]
             )
             return SimpleNamespace(input_ids=input_ids)
-        return SimpleNamespace(input_ids=[ord(char) for char in text])
+        return PieceTokenizer()(text, return_offsets_mapping=return_offsets_mapping)
 
     def convert_tokens_to_ids(self, token: str) -> int:
         assert token == _AUDIO_PAD
