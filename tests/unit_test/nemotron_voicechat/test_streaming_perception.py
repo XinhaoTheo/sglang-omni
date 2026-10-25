@@ -190,3 +190,40 @@ def test_perception_factory_isolates_consecutive_requests(
         result = scheduler.fn(payload)
         actual = NemotronVoiceChatState.from_dict(result.data).acoustic_frames
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("enable_cuda_graph", [True, False])
+@torch.inference_mode()
+def test_perception_factory_encodes_a_batch_like_each_request_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    perception_model: AudioPerception,
+    execution_device: torch.device,
+    enable_cuda_graph: bool,
+) -> None:
+    # note (Xinhao Tan): under TF32 the conv result depends on the batch size.
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(stages, "perception_config", Mock(return_value={}))
+    monkeypatch.setattr(stages, "AudioPerception", Mock(return_value=perception_model))
+    monkeypatch.setattr(stages, "load_module", Mock())
+    scheduler = stages.create_perception_executor(
+        "test-checkpoint",
+        device=execution_device.type,
+        enable_cuda_graph=enable_cuda_graph,
+    )
+    frame_counts = (1, 20, 2, 12, 5)
+    waveforms = [torch.randn(SAMPLES_PER_FRAME * count) / 100 for count in frame_counts]
+    payloads = [
+        StagePayload(
+            str(request_index),
+            OmniRequest(None),
+            NemotronVoiceChatState(waveform=waveform, num_frames=count).to_dict(),
+        )
+        for request_index, (waveform, count) in enumerate(zip(waveforms, frame_counts))
+    ]
+    results = scheduler.batch_fn(payloads)
+    for waveform, result in zip(waveforms, results, strict=True):
+        expected = perception_model([waveform])[0].cpu()
+        actual = NemotronVoiceChatState.from_dict(result.data).acoustic_frames
+        torch.testing.assert_close(
+            actual, expected, rtol=0, atol=1e-5 * expected.abs().max().item()
+        )
