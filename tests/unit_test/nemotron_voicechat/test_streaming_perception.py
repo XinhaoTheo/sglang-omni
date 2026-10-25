@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -161,6 +162,37 @@ def test_a_clip_encodes_the_same_whatever_shares_its_batch(
         stream=stream,
     )
     torch.testing.assert_close(first_rows, second_rows, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "execution_device", [pytest.param("cuda", marks=REQUIRES_CUDA)], indirect=True
+)
+@torch.inference_mode()
+def test_graph_capture_lets_other_threads_use_cuda(
+    monkeypatch: pytest.MonkeyPatch, perception_model: AudioPerception
+) -> None:
+    stream = GraphPerception(perception_model, batch_size=2)
+    encode = stream.encode
+    other_thread_errors: list[RuntimeError] = []
+
+    def use_cuda_in_other_thread() -> None:
+        try:
+            torch.ones(1, device=stream.device).item()
+        except RuntimeError as error:
+            other_thread_errors.append(error)
+
+    def encode_while_other_thread_uses_cuda(mel_BTM: torch.Tensor) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            worker = threading.Thread(target=use_cuda_in_other_thread)
+            worker.start()
+            worker.join()
+        else:
+            pass
+        return encode(mel_BTM)
+
+    monkeypatch.setattr(stream, "encode", encode_while_other_thread_uses_cuda)
+    stream.push(torch.zeros(2, SAMPLES_PER_FRAME, device=stream.device))
+    assert other_thread_errors == []
 
 
 @pytest.mark.parametrize("enable_cuda_graph", [True, False])

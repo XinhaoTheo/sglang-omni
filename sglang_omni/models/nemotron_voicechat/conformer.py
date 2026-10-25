@@ -544,7 +544,10 @@ class GraphPerception(StreamingPerception):
             for buffer, saved_value in zip(buffers, saved_values, strict=True):
                 buffer.copy_(saved_value)
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph, stream=capture_stream):
+            # note (Xinhao Tan): a bucket is first captured under load, while other stage threads use CUDA.
+            with torch.cuda.graph(
+                self.graph, stream=capture_stream, capture_error_mode="thread_local"
+            ):
                 self.graph_output = super().push(self.graph_input)
         else:
             pass
