@@ -105,7 +105,9 @@ def create_perception_executor(
     module.eval()
     parameter_dtype = module.proj.weight.dtype
     perception_stream = (
-        GraphPerception(module) if enable_cuda_graph else StreamingPerception(module)
+        GraphPerception(module, batch_size=1)
+        if enable_cuda_graph
+        else StreamingPerception(module, batch_size=1)
     )
 
     @torch.inference_mode()
@@ -116,16 +118,16 @@ def create_perception_executor(
             rearrange(waveform, "s -> 1 s") if waveform.ndim == 1 else waveform
         )
 
-        frames = module(
-            waveform_1S.to(device=device, dtype=parameter_dtype),
+        (frames,) = module(
+            [waveform_1S[0].to(device=device, dtype=parameter_dtype)],
             stream=perception_stream,
         )
-        assert frames.shape[1] == state.num_frames + 1, (
-            f"Perception returned {frames.shape[1]} rows for {state.num_frames} "
+        assert frames.shape[0] == state.num_frames + 1, (
+            f"Perception returned {frames.shape[0]} rows for {state.num_frames} "
             "frames of audio; expected one more than the frame count."
         )
 
-        state.acoustic_frames = frames[0]
+        state.acoustic_frames = frames
         payload.data = state.to_dict()
         return payload
 

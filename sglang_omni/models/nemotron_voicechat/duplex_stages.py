@@ -194,7 +194,7 @@ def create_perception(
         strict=True,
     )
     hooks = PerceptionHooks(model.eval())
-    hooks.stream.push(torch.zeros(SAMPLES_PER_FRAME, device=concrete_device))
+    hooks.stream.push(torch.zeros(1, SAMPLES_PER_FRAME, device=concrete_device))
     hooks.stream.reset()
     return SessionScheduler(hooks, max_open_sessions=1, max_concurrency=1)
 

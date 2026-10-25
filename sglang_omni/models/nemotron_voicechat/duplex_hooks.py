@@ -52,7 +52,7 @@ class PerceptionState:
 class PerceptionHooks(SessionHooks):
     def __init__(self, model: AudioPerception) -> None:
         self.model = model
-        self.stream = GraphPerception(model)
+        self.stream = GraphPerception(model, batch_size=1)
         self.states: dict[SessionIdentity, PerceptionState] = {}
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
@@ -90,7 +90,9 @@ class PerceptionHooks(SessionHooks):
             waveform = torch.from_numpy(
                 np.frombuffer(raw, dtype="<i2").astype(np.float32)
             )
-            acoustic_features = state.stream.push(waveform / PCM16_INPUT_SCALE).cpu()
+            acoustic_features = state.stream.push(
+                waveform[None] / PCM16_INPUT_SCALE
+            ).cpu()
         else:
             pass
         state.is_ended = chunk.eos

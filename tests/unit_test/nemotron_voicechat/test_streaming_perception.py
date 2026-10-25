@@ -80,12 +80,12 @@ def perception_model(
 def test_stream_owns_history_when_caller_reuses_input(
     perception_model: AudioPerception, stream_class: type[StreamingPerception]
 ) -> None:
-    reused_input_stream = stream_class(perception_model)
-    reference_stream = StreamingPerception(perception_model)
+    reused_input_stream = stream_class(perception_model, batch_size=1)
+    reference_stream = StreamingPerception(perception_model, batch_size=1)
     input_buffer = torch.empty(
-        SAMPLES_PER_FRAME, device=perception_model.proj.weight.device
+        1, SAMPLES_PER_FRAME, device=perception_model.proj.weight.device
     )
-    for samples in torch.randn(10, SAMPLES_PER_FRAME) / 100:
+    for samples in torch.randn(10, 1, SAMPLES_PER_FRAME) / 100:
         input_buffer.copy_(samples)
         torch.testing.assert_close(
             reused_input_stream.push(input_buffer),
@@ -102,14 +102,65 @@ def test_stream_owns_history_when_caller_reuses_input(
 def test_stream_matches_fresh_encoding_across_requests(
     perception_model: AudioPerception, stream_class: type[StreamingPerception]
 ) -> None:
-    stream = stream_class(perception_model)
+    stream = stream_class(perception_model, batch_size=1)
     for frame_count in (1, 20, 2, 12):
-        waveform = torch.randn(1, SAMPLES_PER_FRAME * frame_count) / 100
-        expected = perception_model(waveform)
-        actual = perception_model(waveform, stream=stream)
-        assert actual.shape == (1, frame_count + 1, 8)
+        waveform = torch.randn(SAMPLES_PER_FRAME * frame_count) / 100
+        (expected,) = perception_model([waveform])
+        (actual,) = perception_model([waveform], stream=stream)
+        assert actual.shape == (frame_count + 1, 8)
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("execution_device", "stream_class"), STREAM_CASES, indirect=["execution_device"]
+)
+@pytest.mark.parametrize("batch_size", [4, 5])
+@torch.inference_mode()
+def test_batched_encoding_matches_each_clip_encoded_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    perception_model: AudioPerception,
+    stream_class: type[StreamingPerception],
+    batch_size: int,
+) -> None:
+    # note (Xinhao Tan): under TF32 the conv result depends on the batch size.
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    waveforms = [
+        torch.randn(SAMPLES_PER_FRAME * frame_count) / 100
+        for frame_count in (1, 20, 2, 12)
+    ]
+    batched = perception_model(
+        waveforms, stream=stream_class(perception_model, batch_size=batch_size)
+    )
+    for waveform, rows_TD in zip(waveforms, batched, strict=True):
+        (alone_TD,) = perception_model([waveform])
+        assert rows_TD.shape == alone_TD.shape
+        torch.testing.assert_close(
+            rows_TD, alone_TD, rtol=0, atol=1e-5 * alone_TD.abs().max().item()
+        )
+
+
+@pytest.mark.parametrize(
+    ("execution_device", "stream_class"), STREAM_CASES, indirect=["execution_device"]
+)
+@torch.inference_mode()
+def test_a_clip_encodes_the_same_whatever_shares_its_batch(
+    perception_model: AudioPerception, stream_class: type[StreamingPerception]
+) -> None:
+    stream = stream_class(perception_model, batch_size=3)
+    kept = torch.randn(SAMPLES_PER_FRAME * 12) / 100
+    first_rows, *_ = perception_model(
+        [kept, torch.randn(SAMPLES_PER_FRAME * 20) / 100], stream=stream
+    )
+    second_rows, *_ = perception_model(
+        [
+            kept,
+            torch.randn(SAMPLES_PER_FRAME * 3) / 100,
+            torch.zeros(SAMPLES_PER_FRAME),
+        ],
+        stream=stream,
+    )
+    torch.testing.assert_close(first_rows, second_rows, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("enable_cuda_graph", [True, False])
@@ -130,7 +181,7 @@ def test_perception_factory_isolates_consecutive_requests(
     )
     for request_index in range(2):
         waveform = torch.randn(SAMPLES_PER_FRAME * 20) / 100
-        expected = perception_model(waveform.unsqueeze(0))[0].cpu()
+        expected = perception_model([waveform])[0].cpu()
         payload = StagePayload(
             str(request_index),
             OmniRequest(None),
