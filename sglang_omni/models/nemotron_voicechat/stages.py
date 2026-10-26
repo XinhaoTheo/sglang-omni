@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from pathlib import Path
 
 import torch
@@ -35,6 +36,7 @@ from sglang_omni.preprocessing.transcription import (
     resolve_audio_source,
 )
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.utils.audio import load_audio
@@ -46,6 +48,8 @@ SAMPLES_PER_FRAME = 1_280
 INPUT_SAMPLE_RATE = 16_000
 # note (Xinhao Tan): no 16, on H200 one B=32 step (7.2 ms) is faster than one B=16 step (8.0 ms).
 PERCEPTION_BATCH_SIZES = (1, 2, 4, 8, 32)
+# note (Xinhao Tan): a batch runs as long as its longest clip, so a clip may pad at most its own length.
+PERCEPTION_PADDING_BUDGET = 1.0
 
 
 def perception_config(model_path: str) -> dict:
@@ -83,6 +87,35 @@ def create_preprocessing_executor(
         return payload
 
     return ThreadedSimpleScheduler(preprocess, max_concurrency=max_concurrency)
+
+
+class PerceptionScheduler(SimpleScheduler[StagePayload, StagePayload]):
+    def collect_batch(self, first_msg: IncomingMessage) -> list[IncomingMessage]:
+        # note (Xinhao Tan): the oldest request always runs, a request over the padding budget keeps its place for a later batch.
+        queued = [first_msg, *self.pending_messages]
+        self.pending_messages.clear()
+        while True:
+            try:
+                queued.append(self.inbox.get_nowait())
+            except queue.Empty:
+                break
+        batch: list[IncomingMessage] = []
+        frame_counts: list[int] = []
+        for msg in queued:
+            if msg.type != "new_request" or len(batch) == self.max_batch_size:
+                self.pending_messages.append(msg)
+                continue
+            else:
+                pass
+            num_frames = NemotronVoiceChatState.from_dict(msg.data.data).num_frames
+            shortest = min([*frame_counts, num_frames])
+            longest = max([*frame_counts, num_frames])
+            if longest - shortest <= PERCEPTION_PADDING_BUDGET * shortest:
+                batch.append(msg)
+                frame_counts.append(num_frames)
+            else:
+                self.pending_messages.append(msg)
+        return batch
 
 
 def create_perception_executor(
@@ -141,7 +174,7 @@ def create_perception_executor(
     def encode(payload: StagePayload) -> StagePayload:
         return encode_batch([payload])[0]
 
-    return SimpleScheduler(
+    return PerceptionScheduler(
         encode,
         batch_compute_fn=encode_batch,
         max_batch_size=PERCEPTION_BATCH_SIZES[-1],
