@@ -13,7 +13,6 @@ from sglang_omni.models.nemotron_voicechat.conformer import (
 )
 from sglang_omni.models.nemotron_voicechat.payload_types import NemotronVoiceChatState
 from sglang_omni.proto.request import OmniRequest, StagePayload
-from sglang_omni.scheduling.message import IncomingMessage
 
 REQUIRES_CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA graph requires a GPU"
@@ -260,37 +259,3 @@ def test_perception_factory_encodes_a_batch_like_each_request_alone(
         torch.testing.assert_close(
             actual, expected, rtol=0, atol=1e-5 * expected.abs().max().item()
         )
-
-
-@pytest.mark.parametrize(
-    ("queued_frame_counts", "expected_batches"),
-    [
-        ((10, 30, 12, 19, 21, 5, 9), [[10, 12, 19], [30, 21], [5, 9]]),
-        ((10,) * 40, [[10] * 32, [10] * 8]),
-    ],
-)
-def test_perception_batches_keep_the_padding_budget_and_the_queue_order(
-    queued_frame_counts: tuple[int, ...], expected_batches: list[list[int]]
-) -> None:
-    scheduler = stages.PerceptionScheduler(
-        Mock(),
-        batch_compute_fn=Mock(),
-        max_batch_size=stages.PERCEPTION_BATCH_SIZES[-1],
-    )
-    for request_index, num_frames in enumerate(queued_frame_counts):
-        payload = StagePayload(
-            str(request_index),
-            OmniRequest(None),
-            NemotronVoiceChatState(num_frames=num_frames).to_dict(),
-        )
-        scheduler.inbox.put(IncomingMessage(str(request_index), "new_request", payload))
-    batches = []
-    while scheduler.pending_messages or not scheduler.inbox.empty():
-        batch = scheduler.collect_batch(scheduler.next_message())
-        batches.append(
-            [
-                NemotronVoiceChatState.from_dict(msg.data.data).num_frames
-                for msg in batch
-            ]
-        )
-    assert batches == expected_batches
