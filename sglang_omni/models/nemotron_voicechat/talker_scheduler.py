@@ -53,6 +53,14 @@ class NemotronTalkerScheduler(OmniScheduler):
             pass
         return batch
 
+    def sleep_during_idle(self) -> None:
+        if self.dirty_deferred_request_ids:
+            # note (Xinhao Tan): recheck the deferred requests now, not after the inbox wait.
+            return
+        else:
+            pass
+        super().sleep_during_idle()
+
     def rollback_decode_prep_after_skip(self, batch) -> None:
         if batch.out_cache_loc is not None:
             allocator = self.token_to_kv_pool_allocator
