@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Incremental code2wav decoding must reproduce whole-utterance decoding."""
 
-from unittest.mock import Mock
+import threading
 
 import numpy as np
 import pytest
@@ -182,7 +182,7 @@ def test_graph_runner_decodes_a_window_without_a_graph_eagerly():
 def test_batched_decode_matches_each_window_decoded_alone(
     device: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # note (Xinhao Tan): the batch size picks the convolution algorithm; in float32
+    # note (Xinhao Tan): the batch size picks the convolution algorithm. In float32
     # that moves only the last bits, under TF32 about 1e-3, so TF32 stays off.
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     decoder = make_small_decoder(device)
@@ -225,6 +225,42 @@ def waveform(payload: dict[str, bytes | list[int] | str | int]) -> torch.Tensor:
     )
 
 
+def stream_interleaved(
+    scheduler: NemotronCode2WavScheduler,
+    codes_by_request: dict[str, torch.Tensor],
+    start_steps: dict[str, int],
+) -> list[OutgoingMessage]:
+    outputs: list[OutgoingMessage] = []
+    total_steps = max(
+        start_steps[request_id] + codes.shape[0]
+        for request_id, codes in codes_by_request.items()
+    )
+    for step in range(total_steps):
+        outputs += deliver(
+            scheduler,
+            [
+                stream_chunk(
+                    request_id,
+                    step - start_step,
+                    codes_by_request[request_id][step - start_step][None],
+                )
+                for request_id, start_step in start_steps.items()
+                if 0 <= step - start_step < codes_by_request[request_id].shape[0]
+            ],
+        )
+    return outputs
+
+
+def streamed_audio(outputs: list[OutgoingMessage], request_id: str) -> torch.Tensor:
+    return torch.cat(
+        [
+            waveform(output.data)
+            for output in outputs
+            if output.request_id == request_id and output.type == "stream"
+        ]
+    )
+
+
 def test_one_talker_step_decodes_equal_windows_together_and_exactly() -> None:
     decoder = FrameLocalDecoder()
     scheduler = NemotronCode2WavScheduler(
@@ -237,20 +273,7 @@ def test_one_talker_step_decodes_equal_windows_together_and_exactly() -> None:
         codes = make_codes(total_steps - start_step)
         codes[:, 0] += 100 * offset
         codes_by_request[request_id] = codes
-    outputs: list[OutgoingMessage] = []
-    for step in range(total_steps):
-        outputs += deliver(
-            scheduler,
-            [
-                stream_chunk(
-                    request_id,
-                    step - start_step,
-                    codes_by_request[request_id][step - start_step][None],
-                )
-                for request_id, start_step in start_steps.items()
-                if step >= start_step
-            ],
-        )
+    outputs = stream_interleaved(scheduler, codes_by_request, start_steps)
     for request_id in start_steps:
         outputs += deliver(
             scheduler,
@@ -266,34 +289,110 @@ def test_one_talker_step_decodes_equal_windows_together_and_exactly() -> None:
 
     for request_id, codes in codes_by_request.items():
         expected = FrameLocalDecoder()(codes)
-        streamed = [
-            waveform(output.data)
-            for output in outputs
-            if output.request_id == request_id and output.type == "stream"
-        ]
         (result,) = [
             output
             for output in outputs
             if output.request_id == request_id and output.type == "result"
         ]
-        torch.testing.assert_close(torch.cat(streamed), expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            streamed_audio(outputs, request_id), expected, rtol=0, atol=0
+        )
         torch.testing.assert_close(waveform(result.data.data), expected, rtol=0, atol=0)
     assert (2, 1) in decoder.batch_shapes
-    assert (3, DECODE_WINDOW_FRAMES) in decoder.batch_shapes
+    # note (Xinhao Tan): a batch of 3 windows is padded to a power of two.
+    assert (4, DECODE_WINDOW_FRAMES) in decoder.batch_shapes
 
 
-def test_failed_decode_errors_every_request_of_the_batch() -> None:
-    decoder = FrameLocalDecoder()
-    decoder.decode_batch = Mock(side_effect=RuntimeError("codec failed"))
+BAD_FRAME_ID = 999
+
+
+class FailingFrameDecoder(FrameLocalDecoder):
+    def decode_batch(self, codes_BTQ: torch.Tensor) -> torch.Tensor:
+        if (codes_BTQ[:, :, 0] == BAD_FRAME_ID).any():
+            raise RuntimeError("codec failed")
+        else:
+            pass
+        return super().decode_batch(codes_BTQ)
+
+
+@pytest.mark.parametrize("failing_phase", ["plan", "decode"])
+def test_a_failure_errors_only_its_own_request(failing_phase: str) -> None:
     scheduler = NemotronCode2WavScheduler(
-        decoder, "cpu", compute_fn=None, max_batch_size=8
+        FailingFrameDecoder(), "cpu", compute_fn=None, max_batch_size=8
     )
+    if failing_phase == "plan":
+        bad_codes = torch.zeros(1, NUM_QUANTIZERS + 1, dtype=torch.long)
+    else:
+        bad_codes = make_codes(1) + BAD_FRAME_ID
     outputs = deliver(
+        scheduler,
+        [
+            stream_chunk("a", 0, make_codes(1)),
+            stream_chunk("b", 0, bad_codes),
+            stream_chunk("c", 0, make_codes(1)),
+        ],
+    )
+    assert sorted((output.request_id, output.type) for output in outputs) == [
+        ("a", "stream"),
+        ("b", "error"),
+        ("c", "stream"),
+    ]
+    assert scheduler.is_aborted("b")
+    assert not scheduler.is_aborted("a") and not scheduler.is_aborted("c")
+
+
+def test_decode_runs_without_the_state_lock() -> None:
+    lock_free_during_decode: list[bool] = []
+
+    def try_lock_from_another_thread() -> None:
+        acquired = scheduler.state_lock.acquire(blocking=False)
+        lock_free_during_decode.append(acquired)
+        if acquired:
+            scheduler.state_lock.release()
+        else:
+            pass
+
+    class LockProbeDecoder(FrameLocalDecoder):
+        def decode_batch(self, codes_BTQ: torch.Tensor) -> torch.Tensor:
+            probe = threading.Thread(target=try_lock_from_another_thread)
+            probe.start()
+            probe.join()
+            return super().decode_batch(codes_BTQ)
+
+    scheduler = NemotronCode2WavScheduler(
+        LockProbeDecoder(), "cpu", compute_fn=None, max_batch_size=8
+    )
+    deliver(
         scheduler,
         [stream_chunk("a", 0, make_codes(1)), stream_chunk("b", 0, make_codes(1))],
     )
-    assert [(output.request_id, output.type) for output in outputs] == [
-        ("a", "error"),
-        ("b", "error"),
-    ]
-    assert scheduler.is_aborted("a") and scheduler.is_aborted("b")
+    assert lock_free_during_decode == [True]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+def test_graph_runner_batches_match_each_request_decoded_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # note (Xinhao Tan): steps mix one-window batches (graph replay) and padded
+    # batches of several windows (eager).
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    decoder, runner = make_graph_runner()
+    scheduler = NemotronCode2WavScheduler(
+        runner, "cuda", compute_fn=None, max_batch_size=8
+    )
+    start_steps = {"early": 0, "late_a": 3, "late_b": 3}
+    codes_by_request = {
+        request_id: make_random_codes(DECODE_WINDOW_FRAMES + 6 - start_step)
+        for request_id, start_step in start_steps.items()
+    }
+    outputs = stream_interleaved(scheduler, codes_by_request, start_steps)
+    for request_id, codes in codes_by_request.items():
+        alone = StreamingCodec(decoder, "cuda")
+        expected = torch.cat([alone.push(row[None]) for row in codes])
+        torch.testing.assert_close(
+            streamed_audio(outputs, request_id),
+            expected,
+            rtol=0,
+            atol=1e-5 * expected.abs().max().item(),
+        )
