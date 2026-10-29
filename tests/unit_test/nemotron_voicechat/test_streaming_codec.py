@@ -119,6 +119,15 @@ def test_multi_row_push_and_empty_flush():
     assert codec.emitted_samples == out.numel()
 
 
+@pytest.mark.parametrize("rows_per_push", [1, DECODE_WINDOW_FRAMES + 1])
+def test_retained_codes_stay_within_the_decode_window(rows_per_push):
+    codec = StreamingCodec(FrameLocalDecoder(), "cpu")
+    codes = make_codes(DECODE_WINDOW_FRAMES * 3)
+    for start in range(0, codes.shape[0], rows_per_push):
+        codec.push(codes[start : start + rows_per_push])
+    assert codec.window_codes_TQ.shape[0] == DECODE_WINDOW_FRAMES
+
+
 def make_small_decoder(device: str) -> RVQVAEDecoder:
     torch.manual_seed(0)
     decoder = RVQVAEDecoder(SMALL_CODEC_CONFIG)
