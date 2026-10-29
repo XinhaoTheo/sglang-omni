@@ -206,6 +206,40 @@ def test_talker_rechecks_deferred_requests_once_idle(is_talker_busy: bool) -> No
         )
 
 
+def test_idle_talker_admits_one_of_two_deferred_requests() -> None:
+    scheduler = make_idle_talker_scheduler()
+    scheduler.deferred_request_payloads = {
+        request_id: SimpleNamespace(prefetched_chunks=[])
+        for request_id in ("first", "second")
+    }
+    with patch.object(OmniScheduler, "get_next_batch_to_run", return_value=None):
+        assert scheduler.get_next_batch_to_run() is None
+    first, second = scheduler.take_deferred_request_payloads()
+    assert scheduler.is_request_build_ready(first, pending_stream_done=False)
+    scheduler.waiting_queue.append(first)
+    assert not scheduler.is_request_build_ready(second, pending_stream_done=False)
+    scheduler.deferred_request_payloads["second"] = second
+    with patch.object(OmniScheduler, "get_next_batch_to_run", return_value=None):
+        assert scheduler.get_next_batch_to_run() is None
+    assert scheduler.dirty_deferred_request_ids == set()
+    second.prefetched_chunks.append(SimpleNamespace(data=torch.tensor([7])))
+    assert scheduler.is_request_build_ready(second, pending_stream_done=False)
+
+
+@pytest.mark.parametrize("has_dirty_deferred", [True, False])
+def test_talker_skips_idle_wait_while_deferred_requests_await_recheck(
+    has_dirty_deferred: bool,
+) -> None:
+    scheduler = make_idle_talker_scheduler()
+    if has_dirty_deferred:
+        scheduler.dirty_deferred_request_ids = {"first"}
+    else:
+        pass
+    with patch.object(OmniScheduler, "sleep_during_idle") as idle_wait:
+        scheduler.sleep_during_idle()
+    assert idle_wait.called is not has_dirty_deferred
+
+
 def test_prefetched_text_reaches_talker_queue_in_order() -> None:
     scheduler = object.__new__(NemotronTalkerScheduler)
     scheduler.stream_chunk_handler = None
