@@ -14,10 +14,7 @@ GRAPH_WARMUP_STEPS = 3
 
 
 class CodecDecodeGraphRunner:
-    """Replays the codec decode for every window of 1 to max_window_frames frames.
-
-    A returned waveform belongs to the graph; the next call overwrites it.
-    """
+    """Replays the codec decode for every window of 1 to max_window_frames frames."""
 
     def __init__(
         self,
@@ -26,6 +23,7 @@ class CodecDecodeGraphRunner:
         device: torch.device,
         max_window_frames: int,
     ) -> None:
+        self.decoder: RVQVAEDecoder = decoder
         self.samples_per_frame: int = decoder.samples_per_frame
         self.num_quantizers: int = decoder.num_quantizers
         self.staging_codes_TQ: torch.Tensor = torch.zeros(
@@ -34,8 +32,7 @@ class CodecDecodeGraphRunner:
         self.graph_by_window_frames: dict[int, ReplayableGraph] = {}
         self.waveform_by_window_frames: dict[int, torch.Tensor] = {}
         device_module = torch.get_device_module(device)
-        # note (Xinhao Tan): one pool for every window size. Replays never
-        # overlap, and the caller copies each waveform off before the next call.
+        # note (Xinhao Tan): one pool for every window size. Replays never overlap.
         pool = device_module.graph_pool_handle()
         started = time.perf_counter()
         reserved_before = device_module.memory_reserved(device)
@@ -58,6 +55,13 @@ class CodecDecodeGraphRunner:
 
     def __call__(self, codes_TQ: torch.Tensor) -> torch.Tensor:
         window_frames = codes_TQ.shape[0]
+        graph = self.graph_by_window_frames.get(window_frames)
+        if graph is None:
+            # note (Xinhao Tan): no graph covers this window, so decode it eagerly.
+            return self.decoder(codes_TQ)
+        else:
+            pass
         self.staging_codes_TQ[:window_frames].copy_(codes_TQ)
-        self.graph_by_window_frames[window_frames].replay()
-        return self.waveform_by_window_frames[window_frames]
+        graph.replay()
+        # note (Xinhao Tan): the next replay overwrites the graph output.
+        return self.waveform_by_window_frames[window_frames].clone()
