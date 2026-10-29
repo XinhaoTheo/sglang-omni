@@ -149,3 +149,12 @@ def test_graph_runner_decodes_a_window_without_a_graph_eagerly():
     with torch.inference_mode():
         codes_TQ = make_random_codes(DECODE_WINDOW_FRAMES + 1)
         torch.testing.assert_close(runner(codes_TQ), decoder(codes_TQ), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows_per_push", [1, DECODE_WINDOW_FRAMES + 1])
+def test_retained_codes_stay_within_the_decode_window(rows_per_push):
+    codec = StreamingCodec(FrameLocalDecoder(), "cpu")
+    codes = make_codes(DECODE_WINDOW_FRAMES * 3)
+    for start in range(0, codes.shape[0], rows_per_push):
+        codec.push(codes[start : start + rows_per_push])
+    assert codec.window_codes_TQ.shape[0] == DECODE_WINDOW_FRAMES
