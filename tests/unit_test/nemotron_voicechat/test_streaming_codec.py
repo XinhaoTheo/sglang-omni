@@ -97,9 +97,7 @@ def test_multi_row_push_and_empty_flush():
     assert codec.emitted_samples == out.numel()
 
 
-@pytest.mark.accelerator
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
-def test_graph_replay_matches_eager_decode_for_every_window_size():
+def make_graph_runner() -> tuple[RVQVAEDecoder, CodecDecodeGraphRunner]:
     torch.manual_seed(0)
     device = torch.device("cuda")
     decoder = RVQVAEDecoder(SMALL_CODEC_CONFIG)
@@ -111,12 +109,43 @@ def test_graph_replay_matches_eager_decode_for_every_window_size():
     runner = CodecDecodeGraphRunner(
         decoder, CudaDeviceGraphBackend(), device, DECODE_WINDOW_FRAMES
     )
+    return decoder, runner
 
+
+def make_random_codes(window_frames: int) -> torch.Tensor:
+    return torch.randint(
+        0, CODEBOOK_SIZE + 3, (window_frames, NUM_QUANTIZERS), device="cuda"
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+def test_graph_replay_matches_eager_decode_for_every_window_size():
+    decoder, runner = make_graph_runner()
     with torch.inference_mode():
         for window_frames in range(1, DECODE_WINDOW_FRAMES + 1):
-            codes_TQ = torch.randint(
-                0, CODEBOOK_SIZE + 3, (window_frames, NUM_QUANTIZERS), device=device
-            )
+            codes_TQ = make_random_codes(window_frames)
             torch.testing.assert_close(
                 runner(codes_TQ), decoder(codes_TQ), rtol=0, atol=0
             )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+def test_graph_replay_result_survives_later_replays():
+    _, runner = make_graph_runner()
+    with torch.inference_mode():
+        held = runner(make_random_codes(DECODE_WINDOW_FRAMES))
+        expected = held.clone()
+        runner(make_random_codes(3))
+        runner(make_random_codes(DECODE_WINDOW_FRAMES))
+    torch.testing.assert_close(held, expected, rtol=0, atol=0)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+def test_graph_runner_decodes_a_window_without_a_graph_eagerly():
+    decoder, runner = make_graph_runner()
+    with torch.inference_mode():
+        codes_TQ = make_random_codes(DECODE_WINDOW_FRAMES + 1)
+        torch.testing.assert_close(runner(codes_TQ), decoder(codes_TQ), rtol=0, atol=0)
