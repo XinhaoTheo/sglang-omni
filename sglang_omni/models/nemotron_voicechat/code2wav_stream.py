@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 
 import torch
 
@@ -18,6 +19,17 @@ DECODE_WINDOW_FRAMES = 16
 TAIL_HOLDBACK_SAMPLES = 256
 
 
+@dataclass(frozen=True)
+class DecodeWindow:
+    # note (Xinhao Tan): codes is [T, Q] with at most DECODE_WINDOW_FRAMES frames.
+    codes: torch.Tensor
+    first_sample: int
+    end_sample: int
+
+    def fresh(self, audio_S: torch.Tensor) -> torch.Tensor:
+        return audio_S[self.first_sample : self.end_sample]
+
+
 class StreamingCodec:
     def __init__(self, decoder, device) -> None:
         self.decoder = decoder
@@ -30,8 +42,7 @@ class StreamingCodec:
 
     @torch.inference_mode()
     def push(self, codes_TQ: torch.Tensor) -> torch.Tensor:
-        self.append(codes_TQ)
-        return self.take(self.decoder(self.window_codes_TQ), final=False).float().cpu()
+        return self.decode(self.plan(codes_TQ))
 
     @torch.inference_mode()
     def flush(self) -> torch.Tensor:
@@ -39,22 +50,32 @@ class StreamingCodec:
             return torch.zeros(0)
         else:
             pass
-        return self.take(self.decoder(self.window_codes_TQ), final=True).float().cpu()
+        return self.decode([self.next_window(final=True)])
 
-    def append(self, codes_TQ: torch.Tensor) -> None:
+    def plan(self, codes_TQ: torch.Tensor) -> list[DecodeWindow]:
         window_codes_TQ = torch.cat((self.window_codes_TQ, codes_TQ.to(self.device)))
         self.window_codes_TQ = window_codes_TQ[-DECODE_WINDOW_FRAMES:]
         self.pushed_frames += codes_TQ.shape[0]
+        return [self.next_window(final=False)]
 
-    def take(self, audio_S: torch.Tensor, *, final: bool) -> torch.Tensor:
-        frames = self.pushed_frames
+    def next_window(self, *, final: bool) -> DecodeWindow:
         samples_per_frame = self.decoder.samples_per_frame
-        first = frames - self.window_codes_TQ.shape[0]
-        available = frames * samples_per_frame - (0 if final else TAIL_HOLDBACK_SAMPLES)
-        start = self.emitted_samples - first * samples_per_frame
-        fresh = audio_S[start : available - first * samples_per_frame]
+        first = (self.pushed_frames - self.window_codes_TQ.shape[0]) * samples_per_frame
+        available = self.pushed_frames * samples_per_frame - (
+            0 if final else TAIL_HOLDBACK_SAMPLES
+        )
+        window = DecodeWindow(
+            self.window_codes_TQ, self.emitted_samples - first, available - first
+        )
         self.emitted_samples = available
-        return fresh
+        return window
+
+    def decode(self, windows: list[DecodeWindow]) -> torch.Tensor:
+        return (
+            torch.cat([window.fresh(self.decoder(window.codes)) for window in windows])
+            .float()
+            .cpu()
+        )
 
 
 class StreamState:
@@ -113,61 +134,91 @@ class NemotronCode2WavScheduler(StreamingSimpleScheduler):
             metadata={"modality": "audio"},
         )
 
+    def decode_windows(self, windows: list[DecodeWindow]) -> list[torch.Tensor]:
+        codes_BTQ = torch.stack([window.codes for window in windows])
+        padded_size = 1 << (len(windows) - 1).bit_length()
+        # note (Xinhao Tan): few batch sizes let the allocator reuse its cached blocks.
+        codes_BTQ = torch.cat(
+            (codes_BTQ, codes_BTQ[:1].expand(padded_size - len(windows), -1, -1))
+        )
+        audio_BS = self.decoder.decode_batch(codes_BTQ)[: len(windows)]
+        return [
+            window.fresh(audio_S)
+            for window, audio_S in zip(windows, audio_BS, strict=True)
+        ]
+
     @torch.inference_mode()
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
-        request_ids = [request_id for request_id, _ in items]
+        errors: dict[str, Exception] = {}
+        jobs: list[tuple[str, DecodeWindow]] = []
         with self.state_lock:
-            try:
-                request_ids_by_window_frames: dict[int, list[str]] = {}
-                for request_id, item in items:
+            for request_id, item in items:
+                try:
                     codec = self.states.setdefault(request_id, self.new_state()).codec
-                    codec.append(item.data)
-                    request_ids_by_window_frames.setdefault(
-                        codec.window_codes_TQ.shape[0], []
-                    ).append(request_id)
-                fresh_by_request_id: dict[str, torch.Tensor] = {}
-                for group_request_ids in request_ids_by_window_frames.values():
-                    codecs = [
-                        self.states[request_id].codec
-                        for request_id in group_request_ids
-                    ]
-                    audio_BS = self.decoder.decode_batch(
-                        torch.stack([codec.window_codes_TQ for codec in codecs])
-                    )
-                    for request_id, codec, audio_S in zip(
-                        group_request_ids, codecs, audio_BS, strict=True
-                    ):
-                        fresh_by_request_id[request_id] = codec.take(
-                            audio_S, final=False
-                        )
-                fresh_audio = [
-                    fresh_by_request_id[request_id] for request_id in request_ids
-                ]
+                    jobs += [(request_id, window) for window in codec.plan(item.data)]
+                except Exception as exc:
+                    errors[request_id] = exc
+        # note (Xinhao Tan): no lock while the GPU decodes, so an abort does not wait for it.
+        jobs = [
+            (request_id, window)
+            for request_id, window in jobs
+            if request_id not in errors
+        ]
+        indices_by_window_frames: dict[int, list[int]] = {}
+        for index, (_, window) in enumerate(jobs):
+            indices_by_window_frames.setdefault(window.codes.shape[0], []).append(index)
+        fresh_by_index: dict[int, torch.Tensor] = {}
+        for indices in indices_by_window_frames.values():
+            try:
+                fresh_audio = self.decode_windows([jobs[index][1] for index in indices])
+            except Exception:
+                logger.exception(
+                    f"code2wav decode failed for {len(indices)} windows, "
+                    "decoding them one at a time"
+                )
+                for index in indices:
+                    try:
+                        (fresh_by_index[index],) = self.decode_windows([jobs[index][1]])
+                    except Exception as exc:
+                        errors.setdefault(jobs[index][0], exc)
+            else:
+                fresh_by_index.update(zip(indices, fresh_audio, strict=True))
+        emitted = [
+            (request_id, fresh_by_index[index])
+            for index, (request_id, _) in enumerate(jobs)
+            if request_id not in errors
+        ]
+        host_audio: list[torch.Tensor] = []
+        if emitted:
+            try:
                 # note (Xinhao Tan): every host copy waits for the GPU, so a step copies once.
-                host_audio = (
-                    torch.cat(fresh_audio)
+                host_audio = list(
+                    torch.cat([audio_S for _, audio_S in emitted])
                     .float()
                     .cpu()
-                    .split([audio_S.numel() for audio_S in fresh_audio])
+                    .split([audio_S.numel() for _, audio_S in emitted])
                 )
             except Exception as exc:
-                logger.exception(
-                    f"code2wav decode failed for {len(request_ids)} requests"
-                )
-                for request_id in request_ids:
-                    self.emit_error(request_id, exc)
-                    self.abort_state(request_id)
-                failed_request_ids = request_ids
-            else:
-                for request_id, audio_S in zip(request_ids, host_audio, strict=True):
-                    # note (Xinhao Tan): a split view would pin the whole step's audio.
-                    self.states[request_id].audio_parts.append(audio_S.clone())
-                    if not self.is_aborted(request_id):
-                        self.outbox.put(self.audio_message(request_id, audio_S))
-                    else:
-                        pass
-                failed_request_ids = []
-        for request_id in failed_request_ids:
+                for request_id, _ in emitted:
+                    errors.setdefault(request_id, exc)
+                emitted = []
+        else:
+            pass
+        with self.state_lock:
+            for request_id, exc in errors.items():
+                logger.error(f"code2wav failed for {request_id}: {exc}")
+                self.emit_error(request_id, exc)
+                self.abort_state(request_id)
+            for (request_id, _), audio_S in zip(emitted, host_audio, strict=True):
+                state = self.states.get(request_id)
+                if state is None or self.is_aborted(request_id):
+                    continue
+                else:
+                    pass
+                # note (Xinhao Tan): a split view would pin the whole step's audio.
+                state.audio_parts.append(audio_S.clone())
+                self.outbox.put(self.audio_message(request_id, audio_S))
+        for request_id in errors:
             self.cleanup_aborted_request(request_id)
 
     @torch.inference_mode()
